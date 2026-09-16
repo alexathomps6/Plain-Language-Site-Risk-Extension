@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Plain-Language Site Risk Checker (Demo)",
+  "version": "0.2.0",
+  "description": "Flags risky sites in plain language when you focus a password or payment field. Hackathon demo build — reputation/domain-age checks are mocked locally so it runs with no API keys and no backend. Uses the history permission to check whether this is your first visit to a domain.",
+  "permissions": ["history"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>", "file:///*"],
+      "js": ["content.js"],
+      "css": ["banner.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

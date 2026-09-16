@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Old Community Forum — Login</title>
+<!-- Demo simulation only: old domain, but plain HTTP, no encryption. -->
+<meta name="demo-hostname" content="old-community-forum.net">
+<meta name="demo-https" content="false">
+<meta name="demo-arrived-via-link" content="false">
+<meta name="demo-first-visit" content="false">
+<style>
+  body { font-family: Georgia, serif; background: #eee; margin: 0; padding: 0; }
+  .header { background: #555; color: white; padding: 14px 28px; font-size: 18px; }
+  .card { max-width: 360px; margin: 70px auto; background: #fff; padding: 28px; border: 1px solid #ccc; }
+  label { display: block; font-size: 13px; margin: 12px 0 6px; color: #333; }
+  input { width: 100%; padding: 8px; border: 1px solid #999; box-sizing: border-box; font-size: 14px; }
+  button { margin-top: 18px; width: 100%; padding: 10px; background: #555; color: white; border: none; font-size: 14px; cursor: pointer; }
+  .note { max-width: 360px; margin: 0 auto; text-align: center; color: #888; font-size: 12px; }
+</style>
+</head>
+<body>
+  <div class="header">Old Community Forum</div>
+  <div class="card">
+    <h3 style="margin-top:0;">Member login</h3>
+    <label for="user">Username</label>
+    <input id="user" type="text" autocomplete="username">
+    <label for="pass">Password</label>
+    <input id="pass" type="password" autocomplete="current-password">
+    <button>Log in</button>
+  </div>
+  <p class="note">Demo page — simulates an old, otherwise unremarkable site that simply never upgraded to HTTPS. Click into the password field.</p>
+</body>
+</html>
