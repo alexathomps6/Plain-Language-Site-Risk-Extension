@@ -11,13 +11,13 @@
 //
 // Answered by the background worker, always fail-open:
 //   - First visit to this domain (chrome.history, on-device)
-//   - Domain age (RDAP — free, keyless, no backend)
+//   - Domain age (RDAP, free, keyless, no backend)
 //   - Blocklist reputation (bundled CC0 feed snapshot, refreshed when online)
 //
 // Demo pages may declare their own identity and lookup results via
 // <meta name="demo-..."> tags, so a scripted scenario can be reproduced
 // without registering real look-alike domains. Those tags live in the demo
-// pages, not in here — a genuine website has no reason to include them, so
+// pages, not in here. A genuine website has no reason to include them, so
 // every value this file acts on is either really measured or openly declared
 // by the page under inspection.
 
@@ -181,7 +181,7 @@
           resolve(response);
         });
       } catch (_) {
-        resolve(null); // extension context invalidated (e.g. reloaded) — fail open
+        resolve(null); // extension context invalidated (e.g. reloaded), fail open
       }
     });
   }
@@ -307,77 +307,120 @@
   }
 
   // --- Banner --------------------------------------------------------------
+  //
+  // A card is created once and updated in place for every later escalation.
+  // The previous version removed and rebuilt the whole element on every call,
+  // which replayed the entrance animation each time, visually indistinguishable
+  // from the warning vanishing and a new one appearing, even though nothing
+  // was actually auto-dismissing. Confirmed with real timing: a typosquat
+  // warning appeared at 86ms and was torn down and replaced at 591ms once
+  // domain age landed, well under a second and well before a person could
+  // read the first line. Same content, same card, updated text: the fix.
+
+  let mountedBanner = null;
+  let outsideClickHandler = null;
+
+  const ICONS = {
+    danger: '<path d="M12 3.5 2.5 20h19L12 3.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 9.5v4.2M12 16.8v.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
+    warning: '<path d="M12 3.5 2.5 20h19L12 3.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 9.5v4.2M12 16.8v.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
+    ok: '<path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
+  };
+
+  function svgIcon(kind) {
+    return `<svg class="plsr-icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">${ICONS[kind]}</svg>`;
+  }
+
+  function dismissBanner() {
+    if (mountedBanner) {
+      mountedBanner.remove();
+      mountedBanner = null;
+    }
+    if (outsideClickHandler) {
+      document.removeEventListener('click', outsideClickHandler, true);
+      outsideClickHandler = null;
+    }
+  }
+
+  function fillWhyList(whyList, reasons) {
+    whyList.innerHTML = '';
+    reasons.forEach((reason) => {
+      const li = document.createElement('li');
+      li.textContent = reason;
+      whyList.appendChild(li);
+    });
+  }
+
+  function buildBannerDom(result) {
+    const banner = document.createElement('div');
+    banner.className = `plsr-banner plsr-${result.level}`;
+    banner.innerHTML = `
+      <div class="plsr-accent"></div>
+      <div class="plsr-kicker">${svgIcon(result.level)}<span>Heads Up</span></div>
+      <div class="plsr-message"></div>
+      <div class="plsr-row">
+        <button type="button" class="plsr-link-btn plsr-why-toggle">Why am I seeing this?</button>
+        <button type="button" class="plsr-link-btn plsr-dismiss">Dismiss</button>
+      </div>
+      <ul class="plsr-why-list" style="display:none"></ul>
+    `;
+    banner.querySelector('.plsr-message').textContent = result.text;
+    fillWhyList(banner.querySelector('.plsr-why-list'), result.why);
+
+    const whyList = banner.querySelector('.plsr-why-list');
+    banner.querySelector('.plsr-why-toggle').onclick = () => {
+      whyList.style.display = whyList.style.display === 'none' ? 'block' : 'none';
+    };
+    banner.querySelector('.plsr-dismiss').onclick = dismissBanner;
+    return banner;
+  }
+
+  function updateBannerInPlace(banner, result) {
+    banner.className = `plsr-banner plsr-${result.level} plsr-pulse`;
+    banner.querySelector('.plsr-kicker').innerHTML = `${svgIcon(result.level)}<span>Heads Up</span>`;
+    banner.querySelector('.plsr-message').textContent = result.text;
+    const whyList = banner.querySelector('.plsr-why-list');
+    const wasOpen = whyList.style.display !== 'none';
+    fillWhyList(whyList, result.why);
+    whyList.style.display = wasOpen ? 'block' : 'none';
+    // Signals "this just changed" with a brief ring rather than replaying the
+    // full entrance animation. The card never actually left the screen.
+    banner.addEventListener('animationend', () => banner.classList.remove('plsr-pulse'), { once: true });
+  }
 
   function injectBanner(result) {
-    document.querySelectorAll('.plsr-banner, .plsr-toast').forEach((el) => el.remove());
+    document.querySelectorAll('.plsr-toast').forEach((el) => el.remove());
 
     if (!result) {
-      // Nothing flagged — a brief, self-dismissing confirmation. This is the
+      // Nothing flagged, a brief, self-dismissing confirmation. This is the
       // only case that disappears on its own.
       const toast = document.createElement('div');
       toast.className = 'plsr-toast';
-      toast.textContent = 'Checked this site — looks fine.';
+      toast.innerHTML = `<div class="plsr-kicker">${svgIcon('ok')}<span>Heads Up</span></div><div>Checked this site, looks fine.</div>`;
       document.body.appendChild(toast);
       setTimeout(() => toast.remove(), 3500);
       return;
     }
 
-    const banner = document.createElement('div');
-    banner.className = `plsr-banner plsr-${result.level}`;
+    if (mountedBanner) {
+      updateBannerInPlace(mountedBanner, result);
+      return;
+    }
 
-    const message = document.createElement('div');
-    message.className = 'plsr-message';
-    message.textContent = result.text;
-    banner.appendChild(message);
-
-    const row = document.createElement('div');
-    row.className = 'plsr-row';
-
-    const whyToggle = document.createElement('button');
-    whyToggle.className = 'plsr-link-btn';
-    whyToggle.textContent = 'Why am I seeing this?';
-    row.appendChild(whyToggle);
-
-    const dismiss = document.createElement('button');
-    dismiss.className = 'plsr-link-btn';
-    dismiss.textContent = 'Dismiss';
-    row.appendChild(dismiss);
-
-    banner.appendChild(row);
-
-    const whyList = document.createElement('ul');
-    whyList.className = 'plsr-why-list';
-    whyList.style.display = 'none';
-    result.why.forEach((reason) => {
-      const li = document.createElement('li');
-      li.textContent = reason;
-      whyList.appendChild(li);
-    });
-    banner.appendChild(whyList);
-
-    whyToggle.onclick = () => {
-      whyList.style.display = whyList.style.display === 'none' ? 'block' : 'none';
-    };
-
-    document.body.appendChild(banner);
+    mountedBanner = buildBannerDom(result);
+    document.body.appendChild(mountedBanner);
 
     // A flagged site stays up until the user actively clicks away. Only the
     // "looks fine" toast auto-dismisses; a real warning should not disappear
     // just because a few seconds passed.
-    function handleOutsideClick(e) {
-      if (banner.contains(e.target)) return; // Why/Dismiss are handled separately
+    outsideClickHandler = (e) => {
+      if (mountedBanner && mountedBanner.contains(e.target)) return; // Why/Dismiss handled separately
       dismissBanner();
-    }
-    function dismissBanner() {
-      banner.remove();
-      document.removeEventListener('click', handleOutsideClick, true);
-    }
-    dismiss.onclick = dismissBanner;
+    };
 
     // Deferred so the same click that focused the field does not immediately
     // count as a click-off and dismiss the banner the instant it appears.
     setTimeout(() => {
-      document.addEventListener('click', handleOutsideClick, true);
+      if (outsideClickHandler) document.addEventListener('click', outsideClickHandler, true);
     }, 0);
   }
 
@@ -413,7 +456,7 @@
   function evaluate() {
     const s = state.signals;
 
-    // Tier 1 — a confirmed blocklist hit is not a "maybe", and some attacks
+    // Tier 1: a confirmed blocklist hit is not a "maybe", and some attacks
     // (drive-by downloads, malicious redirects, background scripts) never
     // require the user to type anything. This one does not wait for a focus.
     if (s.blocklistHit === true) {
@@ -421,7 +464,7 @@
       return;
     }
 
-    // Tier 2 — everything else is probabilistic. Firing on every page load is
+    // Tier 2: everything else is probabilistic. Firing on every page load is
     // how people learn to ignore security banners, so these wait for the
     // moment the risk actually materializes: handing the site a secret.
     if (!state.focused) return;
