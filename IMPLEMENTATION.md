@@ -1,8 +1,13 @@
 # Implementation plan
 
-A working build of everything below ships in `site-risk-demo.zip` — this
-document is both the build log for that demo and the spec for extending it
-with a real backend. Where code differs from the shipped demo, it's noted.
+The source for everything below is tracked in `extension/`, with scripted
+scenarios in `demo-pages/` and a test suite in `tests/`. This document is the
+build log.
+
+Nothing here is mocked. There is no backend and there are no API keys: the two
+lookups that would normally need a server — domain age and blocklist
+reputation — are done with an open protocol and a bundled feed instead. See
+steps 3 and 4.
 
 ## Architecture
 
@@ -24,16 +29,14 @@ Content script (per page)
                                                 v
                                     Plain-language message --> banner
 
-Background service worker (owns the `history` permission)
-      ^
-      | "have I visited this hostname before?"
+Background service worker  <-- chrome.runtime.sendMessage --  Content script
       |
-Content script -----------------------------------+
+      +--> chrome.history.search() ----> first visit?   (on-device, no network)
+      +--> rdap.org -> registry --------> domain age    (open protocol, no key)
+      +--> bundled CC0 feed snapshot ---> blocklist     (refreshed on a 12h alarm)
 
-Backend API (not in the demo build — see mocked-vs-real table below)
-      |
-      +--> WHOIS/RDAP lookup ------> domain age
-      +--> Google Safe Browsing ---> known-bad reputation
+Every one of these fails open: timeout, offline or no-data resolves to null,
+never to a verdict.
 ```
 
 Two trigger tiers, not one:
@@ -49,17 +52,19 @@ Two trigger tiers, not one:
   how people learn to ignore security warnings, so they wait for the
   moment the risk actually materializes: handing the site sensitive data.
 
-Three components, not two:
+Two components, not three:
 
 - **Content script** — runs both tiers, reads page context (URL, referrer,
-  HTTPS state), and never reads or transmits what the user types.
-- **Background service worker** — the *only* place that can call
-  `chrome.history.search()`; content scripts can't call `chrome.history`
-  directly, so the content script asks via `chrome.runtime.sendMessage`
+  HTTPS state), inspects the rendered page, and never reads or transmits
+  what the user types.
+- **Background service worker** — owns every lookup the content script
+  cannot do itself. `chrome.history` is unavailable to content scripts, and
+  a cross-origin RDAP fetch from page context is subject to CORS at each
+  redirect hop. The content script asks via `chrome.runtime.sendMessage`
   and the worker answers.
-- **Backend** (production only — mocked in the demo) — does the lookups
-  that need a server (WHOIS, Safe Browsing) and keeps API keys off the
-  client.
+- **No backend.** This used to be a third component. It isn't needed: see
+  steps 3 and 4 for how the two "server-only" lookups were replaced with a
+  keyless protocol and a bundled feed.
 
 ## Build order
 
@@ -131,41 +136,73 @@ device. The lookup is local `chrome.history.search()`, not a network call —
 say this plainly, since `history` is a real permission ask that deserves a
 real answer about where the data goes (nowhere).
 
-### 3. Backend endpoint for a single domain check (production only)
+### 3. Blocklist reputation without an API key
 
-The demo build mocks this step entirely with a local lookup table in
-`content.js` (see the mocked-vs-real table below) so it runs with no
-server and no API keys. For a production version:
+Google Safe Browsing is the obvious choice and it is the wrong one here: it
+requires a key, which requires a server to keep the key off the client, which
+means the extension stops working the moment the server does.
 
-- One endpoint, `POST /check-domain`, taking `{ hostname }`.
-- Start with just the Google Safe Browsing lookup (free API, well
-  documented) — this alone catches a large share of known phishing domains
-  and is the highest-value check for the least effort.
+Instead the extension ships a snapshot of a keyless CC0 community feed at
+`extension/data/blocklist-snapshot.json`, and refreshes it from the source on
+a 12-hour `chrome.alarms` job. Two properties matter:
 
-```js
-app.post('/check-domain', async (req, res) => {
-  const { hostname } = req.body;
-  const safeBrowsingHit = await checkSafeBrowsing(hostname);
-  res.json({ hostname, safeBrowsingHit });
-});
-```
+- **A fresh install with no network still has real data.** The snapshot is in
+  the bundle, so the blocklist is never empty.
+- **Checking a domain tells nobody anything.** The list is matched locally.
+  The feed is fetched wholesale on a timer, unrelated to what is being browsed
+  — unlike a per-lookup reputation API, which learns every domain you visit.
 
-### 4. Add WHOIS domain age (production only)
-
-- Use a WHOIS/RDAP API (many free tiers available) to get the domain's
-  creation date.
-- A domain younger than ~30 days is a strong signal on its own; combine
-  with any brand-like content in the hostname for a bigger signal boost.
+Matching walks up parent domains but only counts exact membership at each
+step, so a listed `evil.example.com` still flags its own subdomains while a
+listed `someone.github.io` never implicates `github.io` as a whole:
 
 ```js
-async function getDomainAgeDays(hostname) {
-  const data = await rdapLookup(hostname); // returns creation date
-  const ageMs = Date.now() - new Date(data.creationDate).getTime();
-  return Math.floor(ageMs / (1000 * 60 * 60 * 24));
+const parts = host.split('.');
+for (let i = 0; i + 2 <= parts.length; i++) {
+  if (set.has(parts.slice(i).join('.'))) return { blocklistHit: true };
 }
 ```
 
-### 5. Add homograph/typosquat distance (real in the demo)
+A refresh that returns an empty or unparseable list is discarded rather than
+written — stale real data beats no data.
+
+### 4. Domain age via RDAP, also without an API key
+
+RDAP is the IETF replacement for WHOIS, and it is an open protocol rather than
+a vendor product: no key, no account, no quota to sign up for. `rdap.org`
+bootstraps to whichever registry is authoritative for the TLD with a 302.
+
+```js
+const response = await fetch(`https://rdap.org/domain/${domain}`, {
+  signal: controller.signal,                    // 2.5s AbortController
+  headers: { accept: 'application/rdap+json' },
+});
+const data = await response.json();
+const registration = (data.events || []).find((e) => e.eventAction === 'registration');
+```
+
+Three things this has to get right:
+
+- **It belongs in the service worker, not the content script.** A page-context
+  fetch is subject to CORS at every hop. Some registries do send
+  `Access-Control-Allow-Origin: *` — Verisign, for `.com`/`.net`, does — but
+  RFC 7480 only *recommends* it, so relying on that would mean the signal
+  works for some TLDs and silently not others. A worker holding matching
+  `host_permissions` is not subject to CORS at all. This is why
+  `manifest.json` lists registry hosts alongside `rdap.org`.
+- **It must fail open.** Timeout, offline, a TLD with no RDAP service, or a
+  registrar that redacts the creation date all resolve to `null` — never to a
+  guess, and never to a warning on their own.
+- **It must be cached, including the failures.** Results are stored in
+  `chrome.storage.local` for 24 hours, keyed by registrable domain. Caching
+  `null` too is what stops an unsupported TLD being re-queried on every single
+  password focus.
+
+Note the registrable-domain step: RDAP is queried for `bbc.co.uk`, not the
+unregistrable `co.uk`, so the worker keeps a small multi-part suffix list. The
+production answer is the full Public Suffix List.
+
+### 5. Add homograph/typosquat distance
 
 - Maintain a small list of commonly spoofed brands (paypal, chase, amazon,
   microsoft, apple, your local bank names for the demo).
@@ -196,7 +233,7 @@ function findTyposquat(hostname) {
 }
 ```
 
-### 6. Add TLD risk and referrer context (real in the demo)
+### 6. Add TLD risk and referrer context
 
 - Static table of higher-risk TLDs (`.zip`, `.top`, `.tk`, `.click`,
   `.xyz`) — no external call needed, just a lookup.
@@ -206,73 +243,95 @@ function findTyposquat(hostname) {
   or messaging app opening a new tab, not a same-browser navigation — see
   known limitations below.
 
-### 7. Combine into a plain-language message
+### 7. Page-level checks: brand claim and form destination
 
-Skip a numeric score entirely — go straight from signals to a sentence.
-This is the full priority order used in the demo build, highest severity
-first:
+These are the first two signals that look at the page rather than the domain,
+and they are what catches a kit on a clean-looking domain that no blocklist
+has seen yet. Both are local DOM reads needing no permission and no network.
+
+**Brand claim** — what does this page present itself as? Title, headings,
+`og:site_name` and logo `alt` text, matched against the known-brand list.
+Deliberately narrow: fuzzy identification of arbitrary brands is the job of
+the optional enrichment call, not of a rule.
+
+**Form destination mismatch** — does the form holding this field submit
+somewhere else? Read the *attribute*, not the `form.action` property: the
+property resolves a missing action to the document URL, which would hide the
+difference between "no action" and "posts to itself".
 
 ```js
-function buildMessage(s) {
-  if (s.safeBrowsingHit === true) {
-    return { level: 'danger', text: 'This site has been reported for phishing or malware. Do not enter any information here.' };
-  }
-  if (s.typosquat && s.domainAgeDays !== null && s.domainAgeDays < 30) {
-    return { level: 'danger', text: `This site was registered ${s.domainAgeDays} days ago and looks like ${s.typosquat.brand}, but is not their real site.` };
-  }
-  if (s.typosquat) {
-    return { level: 'danger', text: `This domain closely resembles ${s.typosquat.brand} but is not their official site.` };
-  }
-  if (s.domainAgeDays !== null && s.domainAgeDays < 30 && s.arrivedViaLink) {
-    return { level: 'warning', text: 'You just arrived here from a link, and this site is brand new. Verify it\u2019s really who it claims to be before entering anything.' };
-  }
-  // No backend domain-age data available (a real, un-mocked site) — but the
-  // free, on-device first-visit signal plus referrer context is still real
-  // and still meaningful on its own.
-  if (s.firstVisit === true && s.arrivedViaLink && s.domainAgeDays === null) {
-    return { level: 'warning', text: 'You\u2019ve never been to this site before, and you just arrived here from a link. Make sure it\u2019s really who it claims to be before entering anything.' };
-  }
-  if (s.tldRisky) {
-    return { level: 'warning', text: 'This domain ending is commonly used for scam and throwaway sites. Double-check this is really who it claims to be.' };
-  }
-  if (!s.isHttps) {
-    return { level: 'warning', text: 'This page is not encrypted. Anything you type here, including your password, can potentially be read by others on the network.' };
-  }
-  return null; // no banner — nothing flagged
+const candidates = [form.getAttribute('action')];
+form.querySelectorAll('[formaction]').forEach((el) => candidates.push(el.getAttribute('formaction')));
+for (const raw of candidates) {
+  const resolved = new URL(raw, location.href);          // guarded by try/catch
+  if (!/^https?:$/.test(resolved.protocol)) continue;    // skip javascript:, data:, mailto:
+  if (resolved.origin !== location.origin) return { destination: resolved.hostname };
 }
 ```
 
-Note the ordering logic: typosquat + known-young domain outranks typosquat
-alone, which outranks the first-visit-only case, because each step down has
-progressively weaker certainty. The first-visit tier only fires when
-`domainAgeDays` is `null` — i.e. only for domains the mocked/real backend
-has no data on at all — so it never overrides a stronger, backend-informed
-signal when one exists.
+Together these produce the strongest message the extension can render on a
+domain with nothing else wrong with it: *"Anything you type here goes to
+someone other than Chase."* That is the scenario in
+`demo-pages/6-form-action-mismatch.html`, where every Tier 1 check passes.
 
-### 8. Split the trigger by tier
+### 8. Tier 4: the message template set
+
+Skip a numeric score entirely — go straight from signals to a sentence. Not a
+chain of `if` statements returning string literals, but a priority-ordered
+array of templates, each a pure function of the signals:
 
 ```js
-async function initialize() {
-  const baseCtx = getContext(); // hostname, isHttps, arrivedViaLink, mocked domainAge/safeBrowsingHit
-  const firstVisit = await getFirstVisitSignal(baseCtx.hostname);
-  const ctx = { ...baseCtx, firstVisit };
-
-  // Tier 1: fires unconditionally, before any interaction
-  if (ctx.safeBrowsingHit === true) {
-    injectBanner({ level: 'danger', text: '...' });
-    return;
-  }
-
-  // Tier 2: fires only when the user focuses a sensitive field
-  document.addEventListener('focusin', (e) => {
-    if (!isSensitiveField(e.target)) return;
-    const signals = computeSignals(ctx); // adds typosquat + tldRisky
-    injectBanner(buildMessage(signals));
-  });
+{
+  id: 'young_domain_brand_mismatch',
+  level: 'danger',
+  when: (s) => s.typosquat && s.domainAgeDays !== null && s.domainAgeDays < NEW_DOMAIN_DAYS,
+  template: 'This site was registered {age} and is not the real {brand}.',
+  slots: (s) => ({ age: humanizeAge(s.domainAgeDays), brand: brandLabel(s.typosquat.brand) }),
+  evidence: ['typosquat_distance', 'domain_age'],
+  why: (s) => [ /* the expandable detail list */ ],
 }
 ```
 
-### 9. Banner UI
+The structure is what makes the README's guarantees true rather than
+aspirational: the same evidence always selects the same template and fills the
+same slots, so a verdict is reproducible and explainable after the fact, and
+every template declares `evidence` refs so a message can always name the
+signals behind it.
+
+Ordering runs highest-certainty first — blocklist hit, then form mismatch,
+then typosquat-plus-young-domain, then typosquat alone, down to the weak
+single signals. The first-visit-only template fires solely when
+`domainAgeDays` is `null`, so it never speaks over a stronger age-informed
+signal.
+
+### 9. Split the trigger by tier, and let the banner escalate
+
+Signals do not all arrive at once. TLD and typosquat are synchronous; history
+and RDAP are not. A one-shot "show the first verdict and stop" latch would
+mean a real RDAP answer arriving a few hundred milliseconds later is computed
+and then thrown away.
+
+So the verdict is re-evaluated whenever new evidence lands, and the banner may
+upgrade in place — but never downgrade:
+
+```js
+function render(result) {
+  const level = result ? result.level : 'none';
+  if (LEVEL_RANK[level] < LEVEL_RANK[state.shownLevel]) return; // never downgrade
+  if (result && result.id === state.shownId) return;            // already showing this
+  injectBanner(result);
+}
+```
+
+The no-downgrade rule matters: a card that has said "dangerous" must not
+soften because a slower, weaker signal resolved afterwards. Tier 1 still fires
+without waiting for a focus; everything else waits for the sensitive field.
+
+One subtlety worth recording, because it was a real bug: the lookups are gated
+on having a hostname worth looking up, not on `location.protocol`. Gating on
+protocol meant a page that was not `http(s)` never fired RDAP at all, which
+silently disabled escalation everywhere it was most worth testing.
+### 10. Banner UI
 
 - Small, non-blocking card injected in the page (not a full browser alert,
   which people dismiss reflexively).
@@ -284,51 +343,73 @@ async function initialize() {
   rather than nothing at all — this keeps the check visibly active without
   becoming a persistent, ignorable badge.
 
-## What's mocked vs. real in the shipped demo
+## What runs for real
 
-| Signal | Trigger | Status | Real version |
-|---|---|---|---|
-| Phishing blocklist hit | Immediate, on page load | Mocked (local lookup table) | Step 3 — Google Safe Browsing |
-| HTTPS vs HTTP | On password/payment focus | Real | — |
-| Risky TLD | On password/payment focus | Real | — |
-| Typosquat / homograph distance | On password/payment focus | Real | — |
-| Referrer / "arrived via link" | On password/payment focus | Real for same-browser navigation | See limitation below for SMS/email/QR |
-| First visit to this domain | On password/payment focus | Real (`chrome.history`) | — |
-| Domain age | On password/payment focus | Mocked (local lookup table) | Step 4 — WHOIS/RDAP |
+Nothing is mocked. Every signal below runs from the loaded extension with no
+API key and no server, and is covered by `./tests/run.sh`.
+
+| Signal | Trigger | How it works |
+|---|---|---|
+| Phishing blocklist hit | Immediate, on page load | Bundled CC0 feed snapshot, refreshed on a 12h alarm; matched locally |
+| HTTPS vs HTTP | On password/payment focus | `location.protocol` |
+| Risky TLD | On password/payment focus | Static set, no network |
+| Typosquat / homograph distance | On password/payment focus | Levenshtein against a brand list, whole label and per segment |
+| Brand claim | On password/payment focus | Title, headings, `og:site_name`, logo `alt` |
+| Form destination mismatch | On password/payment focus | `action` / `formaction` attribute resolved against `location.origin` |
+| Referrer / "arrived via link" | On password/payment focus | `document.referrer`; same-browser navigation only |
+| First visit to this domain | On password/payment focus | `chrome.history.search()` in the worker, on-device |
+| Domain age | On password/payment focus, async | Live RDAP via `rdap.org`, cached 24h, 2.5s timeout, fails open |
+
+The demo pages in `demo-pages/` declare their own identity and lookup results
+through `<meta name="demo-...">` tags, so a scenario is reproducible without
+registering real look-alike domains. Those tags live in the pages, not in the
+extension: `content.js` contains no fabricated data, so every value it acts on
+is either really measured or openly declared by the page under inspection.
 
 ## Known limitations (be upfront about these to judges)
 
-- **Content/behavior signals are out of scope for a one-day build.** Logo
-  mismatch detection and form-destination-mismatch checks need DOM/image
-  analysis that's a meaningfully bigger lift than the metadata checks
-  above. Form-action-mismatch (does the form submit to a different domain
-  than the page itself) is the single best next addition — it's a real DOM
-  read, needs no new permissions, and catches phishing pages even when the
-  domain itself looks clean.
-- **`document.referrer` doesn't capture "arrived via SMS/QR code."** It
-  only sees same-browser navigations. Detecting "opened from a messaging
-  app" needs OS-level or app-level context a content script doesn't have.
-  For the hackathon, this is best simulated in the demo rather than fully
-  implemented.
-- **False positives on legitimately new domains or first visits.** A
-  brand-new startup's real site will trigger the domain-age signal, and
-  everyone's first visit to any new legitimate service will trigger the
-  first-visit signal. The plain-language message should invite scrutiny,
-  not declare certainty — and is exactly why these stay on the
-  action-triggered tier instead of blocking the page outright.
-- **WHOIS/RDAP data isn't always complete or fast** — some registrars
-  redact creation dates or rate-limit lookups; add a timeout and fail open
-  (don't block the page if the lookup is slow). The demo's
-  `getFirstVisitSignal` already follows this pattern for history lookups —
-  a failed or errored lookup resolves to `null`, not a false positive.
+- **There is no certificate check, deliberately.** Chrome gives extensions no
+  way to read a TLS certificate. Firefox has `webRequest.getSecurityInfo()`;
+  the Chrome equivalent is still only a
+  [proposal](https://github.com/w3c/webextensions/issues/882). The one working
+  route is `chrome.debugger` with `Network.getCertificate`, which pins a
+  *"… started debugging this browser"* infobar to every tab — an unreasonable
+  ask for a tool selling trustworthiness. The claim was removed from the README
+  rather than faked.
+- **`document.referrer` doesn't capture "arrived via SMS/QR code."** It only
+  sees same-browser navigations. Detecting "opened from a messaging app" needs
+  OS-level context a content script doesn't have. The extension claims only
+  what it can see: that the user followed a link rather than typing the address.
+- **Brand claim extraction only knows the brands on its list.** A page
+  impersonating a brand outside `KNOWN_BRANDS` produces the brandless variant
+  of the message ("goes to someone other than this site"), which is weaker but
+  still correct. Widening this is precisely the job of the optional enrichment
+  call, and precisely why it is optional.
+- **False positives on legitimately new domains or first visits.** A brand-new
+  startup's real site will trigger the domain-age signal, and everyone's first
+  visit to any new legitimate service will trigger the first-visit signal. The
+  message invites scrutiny rather than declaring certainty — and this is
+  exactly why these stay on the action-triggered tier instead of blocking the
+  page outright.
+- **RDAP isn't universal.** Some TLDs publish no RDAP service and some
+  registrars redact the creation date; `.tk` in particular, a TLD the risk
+  table already flags, is unlikely to answer. All of these resolve to "no
+  data", which produces no warning on its own — the risky-TLD signal still
+  fires independently.
+- **The blocklist is a community snapshot, not Safe Browsing.** It catches
+  domains that have already been reported and will miss a kit in its first
+  hours. That gap is the entire argument for the page-level checks.
 
 ## Stretch goals if time allows
 
-- Form-action-mismatch check (see limitations above) — highest value,
-  needs no new permissions.
-- Client-side caching of previously checked, trusted domains to avoid
-  repeat lookups and speed up the demo.
-- LLM-generated message phrasing instead of the static rule table, for more
-  natural, specific explanations.
-- A small allowlist the user can add to ("always trust my bank's real
-  domain") to cut down repeat warnings.
+- Tier 3 traffic inspection: observational `webRequest` listeners for redirect
+  chains, third-party script origins, and exfil-shaped beacons. This is what
+  demo step 6 needs.
+- The remaining Tier 2 checks: field-inventory plausibility, overlay and iframe
+  trickery, keystroke-capture detection, structural clone similarity.
+- The full Public Suffix List in place of the small multi-part suffix set, so
+  registrable-domain extraction is correct for every ccTLD.
+- A user allowlist ("always trust my bank's real domain") to cut repeat
+  warnings.
+- The optional enrichment call, for brand identification beyond the fingerprint
+  list.
