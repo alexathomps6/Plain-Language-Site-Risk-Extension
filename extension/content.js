@@ -412,8 +412,17 @@
     // A flagged site stays up until the user actively clicks away. Only the
     // "looks fine" toast auto-dismisses; a real warning should not disappear
     // just because a few seconds passed.
+    //
+    // Re-clicking the very field the warning is about (to reposition the
+    // cursor before typing, which is completely normal) does not count as
+    // "clicking away" -- it is the opposite, continued engagement with the
+    // exact thing the warning is warning about. Confirmed as a real bug: a
+    // second click on the same password field was dismissing the banner
+    // essentially every time, since that field sits outside the banner's own
+    // DOM subtree just like any other "outside" element.
     outsideClickHandler = (e) => {
       if (mountedBanner && mountedBanner.contains(e.target)) return; // Why/Dismiss handled separately
+      if (isSensitiveField(e.target)) return; // re-focusing the field itself is not clicking away
       dismissBanner();
     };
 
