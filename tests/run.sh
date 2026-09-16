@@ -5,7 +5,8 @@
 #
 # tests/signals.html    drives content.js in stubbed DOMs and asserts on the
 #                       banner it renders: template selection, escalation,
-#                       fail-open behaviour, and background.js pure helpers.
+#                       fail-open behaviour, Tier 2/3 inspection criteria, and
+#                       background.js pure helpers.
 # tests/demo-pages.html loads every real demo-pages/*.html and asserts each
 #                       still produces the result DEMO.md documents.
 set -u
@@ -42,6 +43,12 @@ run_suite() {
 
 CONTENT=$(base64 -w0 extension/content.js)
 BACKGROUND=$(base64 -w0 extension/background.js)
+INSPECTION=$(base64 -w0 extension/page-inspection.js)
+PROBE=$(base64 -w0 extension/page-probe.js)
+# Injected in the same order the manifest loads them: probe first (it wraps
+# fetch/XHR/beacon/WebSocket and must be in place before the page can call
+# them), then the Tier 2 criteria module, then content.js.
+SCRIPTS="window.__PROBE_B64=\"$PROBE\";window.__INSPECTION_B64=\"$INSPECTION\";window.__CONTENT_B64=\"$CONTENT\";"
 
 { printf '['; first=1
   for f in demo-pages/*.html; do
@@ -53,10 +60,10 @@ PAGES=$(base64 -w0 "$WORK/pages.json")
 
 status=0
 echo "=== signals ==="
-run_suite signals.html "window.__CONTENT_B64=\"$CONTENT\";window.__BACKGROUND_B64=\"$BACKGROUND\";" || status=1
+run_suite signals.html "${SCRIPTS}window.__BACKGROUND_B64=\"$BACKGROUND\";" || status=1
 echo
 echo "=== demo pages ==="
-run_suite demo-pages.html "window.__CONTENT_B64=\"$CONTENT\";window.__PAGES_B64=\"$PAGES\";" || status=1
+run_suite demo-pages.html "${SCRIPTS}window.__PAGES_B64=\"$PAGES\";" || status=1
 
 echo
 [ $status -eq 0 ] && echo "ALL SUITES PASSED" || echo "SUITE FAILURES"

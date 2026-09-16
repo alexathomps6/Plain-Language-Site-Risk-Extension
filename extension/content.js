@@ -9,17 +9,35 @@
 //   - Brand claim extracted from the rendered page
 //   - Form destination mismatch (does the credential form post somewhere else)
 //
+// Tier 2, rendered page inspection (page-inspection.js, local DOM reads):
+//   - Credential overlay, measured by hit-testing the field's own box
+//   - Hidden shadow copies of a sensitive field
+//   - Field inventory against plausibility
+//   - Fake browser chrome rendered into the page
+//   - Form posting over plain HTTP from an HTTPS page
+//   - Third-party iframe over the credential area
+//   - Obfuscated inline script, anti-inspection code, pressure language
+//
+// Tier 3, network traffic inspection (metadata only, never bodies):
+//   - page-probe.js, in the page's own world: traffic correlated with
+//     keystrokes in a sensitive field, live channels, runtime rewriting of a
+//     form's destination
+//   - background.js, via webRequest: redirect chains, raw-IP endpoints,
+//     unrelated script origins, known credential-relay services
+//
 // Answered by the background worker, always fail-open:
 //   - First visit to this domain (chrome.history, on-device)
 //   - Domain age (RDAP, free, keyless, no backend)
 //   - Blocklist reputation (bundled CC0 feed snapshot, refreshed when online)
 //
-// Demo pages may declare their own identity and lookup results via
+// Demo pages may declare their own identity and Tier 1 lookup results via
 // <meta name="demo-..."> tags, so a scripted scenario can be reproduced
 // without registering real look-alike domains. Those tags live in the demo
-// pages, not in here. A genuine website has no reason to include them, so
-// every value this file acts on is either really measured or openly declared
-// by the page under inspection.
+// pages, not in here, and they cover Tier 1 only — every Tier 2 and Tier 3
+// finding is measured from the page as it actually renders and behaves. A
+// genuine website has no reason to include those tags, so every value this
+// file acts on is either really measured or openly declared by the page under
+// inspection.
 
 (function () {
   const KNOWN_BRANDS = ['paypal', 'chase', 'amazon', 'microsoft', 'apple', 'bankofamerica', 'wellsfargo'];
@@ -76,6 +94,27 @@
     const years = Math.floor(days / 365);
     return years === 1 ? 'a year ago' : `${years} years ago`;
   }
+
+  function humanList(items) {
+    if (items.length <= 1) return items[0] || '';
+    return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+  }
+
+  const TRAFFIC_LABELS = {
+    fetch: 'background request',
+    xhr: 'background request',
+    beacon: 'beacon',
+    websocket: 'live connection',
+  };
+
+  // page-inspection.js is a content script loaded ahead of this one, so it has
+  // already populated this global. The fallback keeps the extension working
+  // (minus Tier 2) if that file ever fails to load, rather than throwing and
+  // taking every other signal down with it.
+  const INSPECTION = globalThis.PLSR_PAGE_INSPECTION || {
+    CRITERIA: { network: { exfilWhileTyping: { maxMsSinceKeystroke: 2000, kinds: [] } } },
+    inspectPage: () => ({}),
+  };
 
   function findTyposquat(hostname) {
     const core = coreName(hostname);
@@ -203,6 +242,21 @@
       why: () => ['Listed on a community phishing blocklist'],
     },
     {
+      // Tier 3, the strongest thing this extension can observe: data leaving
+      // the page on the same keystrokes the user is making, with no form
+      // submission anywhere in sight.
+      id: 'exfil_while_typing',
+      level: 'danger',
+      when: (s) => Boolean(s.probe.exfilWhileTyping),
+      template: 'This page is sending what you type as you type it, before you ever hit submit.',
+      evidence: ['exfil_while_typing'],
+      why: (s) => [
+        `A ${TRAFFIC_LABELS[s.probe.exfilWhileTyping.kind] || 'request'} was sent to ` +
+        `${s.probe.exfilWhileTyping.host} ${s.probe.exfilWhileTyping.msSinceKeystroke}ms after you typed in this field`,
+        'No form had been submitted at that point, so this was not a normal sign-in',
+      ],
+    },
+    {
       id: 'form_action_mismatch',
       level: 'danger',
       when: (s) => Boolean(s.formMismatch),
@@ -212,6 +266,100 @@
       why: (s) => [
         `The form on this page submits to ${s.formMismatch.destination}, not to this site`,
         ...(s.claimedBrand ? [`This page presents itself as ${brandLabel(s.claimedBrand)}`] : []),
+      ],
+    },
+    {
+      // The static check above reads the markup. This one catches the evasion
+      // of shipping clean markup and repointing the form from script once the
+      // page is live.
+      id: 'action_mutated_at_runtime',
+      level: 'danger',
+      when: (s) => Boolean(s.probe.actionMutation),
+      template: 'This page quietly changed where your details get sent after it finished loading.',
+      evidence: ['action_mutated_at_runtime'],
+      why: (s) => [
+        `Script on this page rewrote the form's ${s.probe.actionMutation.attribute} to point at ${s.probe.actionMutation.host}`,
+        'The destination in the page source was not the destination that would have been used',
+      ],
+    },
+    {
+      id: 'insecure_form_action',
+      level: 'danger',
+      when: (s) => Boolean(s.page && s.page.insecureFormAction),
+      template: 'The padlock on this page does not cover your password — this form sends it unencrypted.',
+      evidence: ['insecure_form_action'],
+      why: (s) => [
+        `The page is HTTPS, but the form submits over plain HTTP to ${s.page.insecureFormAction.destination}`,
+        'Anyone on the same network can read what is submitted',
+      ],
+    },
+    {
+      id: 'credential_overlay_iframe',
+      level: 'danger',
+      when: (s) => Boolean(s.page && s.page.overlay && s.page.overlay.kind === 'iframe'),
+      template: "The box you're typing into isn't part of this page — it belongs to {host}.",
+      slots: (s) => ({ host: s.page.overlay.host || 'another site' }),
+      evidence: ['credential_overlay'],
+      why: (s) => [
+        `A window from ${s.page.overlay.host || 'another site'} is layered over this field`,
+        `It covers ${s.page.overlay.coveredPoints} of ${s.page.overlay.sampled} points tested across the field`,
+      ],
+    },
+    {
+      id: 'credential_overlay_invisible',
+      level: 'danger',
+      when: (s) => Boolean(s.page && s.page.overlay && s.page.overlay.kind === 'invisible'),
+      template: "The box you're typing into isn't part of this page — something is layered over it.",
+      evidence: ['credential_overlay'],
+      why: (s) => [
+        `An invisible <${s.page.overlay.tag}> element sits on top of this field`,
+        `It covers ${s.page.overlay.coveredPoints} of ${s.page.overlay.sampled} points tested across the field`,
+      ],
+    },
+    {
+      id: 'shadow_capture_input',
+      level: 'danger',
+      when: (s) => Boolean(s.page && s.page.shadowInput),
+      template: 'There is a second, hidden copy of this field on the page, collecting the same thing you type.',
+      evidence: ['shadow_capture_input'],
+      why: (s) => [
+        `A hidden field ("${s.page.shadowInput.name}") duplicates the one you can see`,
+        'Legitimate sign-in forms do not keep an invisible copy of your password',
+      ],
+    },
+    {
+      id: 'fake_browser_chrome',
+      level: 'danger',
+      when: (s) => Boolean(s.page && s.page.fakeBrowserChrome && s.page.fakeBrowserChrome.spoofed),
+      template: 'The address bar at the top of this page is a picture drawn by the page, not your real one.',
+      evidence: ['fake_browser_chrome'],
+      why: (s) => [
+        `The page draws "${s.page.fakeBrowserChrome.shownHost}" with a padlock, as if it were the browser's address bar`,
+        `You are actually on ${s.page.fakeBrowserChrome.actualHost}`,
+      ],
+    },
+    {
+      id: 'exfil_service_endpoint',
+      level: 'danger',
+      when: (s) => Boolean(s.network && s.network.exfilServices.length),
+      template: 'This page is wired to send data to {service}, which is commonly used to collect stolen logins.',
+      slots: (s) => ({ service: s.network.exfilServices[0].label }),
+      evidence: ['exfil_service_endpoint'],
+      why: (s) => [
+        `The page contacted ${s.network.exfilServices[0].host}, a known credential drop-off service`,
+        'A real sign-in page sends your details to its own servers',
+      ],
+    },
+    {
+      id: 'raw_ip_endpoint',
+      level: 'danger',
+      when: (s) => Boolean(s.network && s.network.rawIpHosts.length),
+      template: 'This sign-in page is talking to a bare IP address instead of a named site.',
+      slots: (s) => ({ host: s.network.rawIpHosts[0] }),
+      evidence: ['raw_ip_endpoint'],
+      why: (s) => [
+        `Code or data on this page goes to ${s.network.rawIpHosts[0]}, which has no domain name behind it`,
+        'Established services put their infrastructure behind named domains',
       ],
     },
     {
@@ -235,6 +383,94 @@
       evidence: ['typosquat_distance'],
       why: (s) => [
         `Domain name is ${s.typosquat.distance} character${s.typosquat.distance === 1 ? '' : 's'} off from "${s.typosquat.brand}"`,
+      ],
+    },
+    {
+      id: 'field_inventory_branded',
+      level: 'danger',
+      when: (s) => Boolean(s.page && s.page.fieldInventory) && Boolean(s.claimedBrand),
+      template: '{brand} does not ask for {extras} to sign in. This page does.',
+      slots: (s) => ({
+        brand: brandLabel(s.claimedBrand),
+        extras: humanList(s.page.fieldInventory.extras),
+      }),
+      evidence: ['field_inventory_implausible', 'brand_claim'],
+      why: (s) => [
+        `This one form asks for ${humanList(s.page.fieldInventory.extras)} alongside your password`,
+        `This page presents itself as ${brandLabel(s.claimedBrand)}`,
+      ],
+    },
+    {
+      id: 'field_inventory_unbranded',
+      level: 'warning',
+      when: (s) => Boolean(s.page && s.page.fieldInventory),
+      template: 'A sign-in page has no reason to ask for {extras} as well as your password.',
+      slots: (s) => ({ extras: humanList(s.page.fieldInventory.extras) }),
+      evidence: ['field_inventory_implausible'],
+      why: (s) => [
+        `This one form asks for ${humanList(s.page.fieldInventory.extras)} alongside your password`,
+        'Collecting several unrelated kinds of sensitive data in one form is a harvesting pattern',
+      ],
+    },
+    {
+      id: 'third_party_credential_frame',
+      level: 'warning',
+      when: (s) => Boolean(s.page && s.page.thirdPartyFrame),
+      template: 'The sign-in box on this page is served by {host}, which is not part of this site.',
+      slots: (s) => ({ host: s.page.thirdPartyFrame.host }),
+      evidence: ['third_party_credential_frame'],
+      why: (s) => [
+        `The credential area is covered by a frame from ${s.page.thirdPartyFrame.host}`,
+        'That host is not a recognised payment or sign-in provider',
+      ],
+    },
+    {
+      id: 'websocket_on_credential_page',
+      level: 'warning',
+      when: (s) => s.probe.websocketHosts.length > 0 || Boolean(s.network && s.network.websocketHosts.length),
+      template: 'This page opened a live connection to {host} while asking you to sign in.',
+      slots: (s) => ({ host: s.probe.websocketHosts[0] || s.network.websocketHosts[0] }),
+      evidence: ['websocket_on_credential_page'],
+      why: (s) => [
+        `A live channel to ${s.probe.websocketHosts[0] || s.network.websocketHosts[0]} is open on this page`,
+        'Relay kits use live channels to forward what you type to an operator immediately',
+      ],
+    },
+    {
+      id: 'suspicious_redirect_chain',
+      level: 'warning',
+      when: (s) => Boolean(s.network && s.network.redirectChain),
+      template: 'You were bounced through {hops} other sites to reach this page.',
+      slots: (s) => ({ hops: s.network.redirectChain.hops }),
+      evidence: ['redirect_chain'],
+      why: (s) => [
+        s.network.redirectChain.shortener
+          ? `The trail started at the link shortener ${s.network.redirectChain.shortener}`
+          : `The trail crossed ${s.network.redirectChain.sites.length} different sites: ${s.network.redirectChain.sites.join(' \u2192 ')}`,
+        'Chained redirects are used to hide where a link really leads',
+      ],
+    },
+    {
+      id: 'obfuscated_script',
+      level: 'warning',
+      when: (s) => Boolean(s.page && s.page.obfuscatedScript),
+      template: 'The code running on this page is deliberately scrambled, which a real sign-in page has no reason to do.',
+      evidence: ['obfuscated_script'],
+      why: (s) => [
+        `An inline script on this page ${humanList(s.page.obfuscatedScript.indicators)}`,
+        'Phishing kits scramble their code to slow down anyone inspecting them',
+      ],
+    },
+    {
+      id: 'unrelated_script_origin',
+      level: 'warning',
+      when: (s) => Boolean(s.network && s.network.unrelatedScriptHosts.length),
+      template: 'This sign-in page runs code from {host}, which has nothing to do with this site.',
+      slots: (s) => ({ host: s.network.unrelatedScriptHosts[0] }),
+      evidence: ['unrelated_script_origin'],
+      why: (s) => [
+        `Executable code was loaded from ${s.network.unrelatedScriptHosts[0]}`,
+        'That host is neither this site nor a recognised content delivery network',
       ],
     },
     {
@@ -280,6 +516,39 @@
     },
   ];
 
+  // Signals too weak to select a message on their own, but worth showing in
+  // the expandable detail once something else has fired. Each is appended only
+  // if the chosen template did not already cite it.
+  //
+  // Keystroke listeners and urgency phrasing live here rather than in
+  // TEMPLATES on purpose: a password strength meter binds to every keystroke,
+  // and plenty of legitimate account-recovery pages sound urgent. As
+  // corroboration they are useful; as a verdict they would be a false alarm
+  // generator, and a false alarm on a real bank login is the exact failure
+  // this project exists to avoid.
+  const SUPPORTING = [
+    {
+      evidence: 'first_visit',
+      when: (s) => s.firstVisit === true,
+      text: () => 'First time this browser has visited this domain',
+    },
+    {
+      evidence: 'keystroke_listener',
+      when: (s) => s.probe.keystrokeListeners.length > 0,
+      text: (s) => `Script on this page is listening to every "${s.probe.keystrokeListeners[0]}" event in this field`,
+    },
+    {
+      evidence: 'pressure_language',
+      when: (s) => Boolean(s.page && s.page.pressureLanguage),
+      text: (s) => `Page uses urgency or account-suspension language (${s.page.pressureLanguage.matches} distinct phrases)`,
+    },
+    {
+      evidence: 'anti_inspection',
+      when: (s) => Boolean(s.page && s.page.antiInspection),
+      text: (s) => `Page tries to prevent inspection: ${s.page.antiInspection.technique}`,
+    },
+  ];
+
   function fillSlots(template, slots) {
     return template.replace(/\{(\w+)\}/g, (match, key) => (key in slots ? slots[key] : match));
   }
@@ -291,17 +560,15 @@
     const slots = match.slots ? match.slots(signals) : {};
     const why = match.why ? match.why(signals) : [];
 
-    // The first-visit signal is real and free, so it is worth surfacing as
-    // supporting detail on any warning that did not already cite it.
-    const withFirstVisit = signals.firstVisit === true && !match.evidence.includes('first_visit')
-      ? [...why, 'First time this browser has visited this domain']
-      : why;
+    const supporting = SUPPORTING
+      .filter((sup) => !match.evidence.includes(sup.evidence) && sup.when(signals))
+      .map((sup) => sup.text(signals));
 
     return {
       id: match.id,
       level: match.level,
       text: fillSlots(match.template, slots),
-      why: withFirstVisit,
+      why: [...why, ...supporting],
       evidence: match.evidence,
     };
   }
@@ -395,7 +662,7 @@
       // only case that disappears on its own.
       const toast = document.createElement('div');
       toast.className = 'plsr-toast';
-      toast.innerHTML = `<div class="plsr-kicker">${svgIcon('ok')}<span>Heads Up</span></div><div>Checked this site, looks fine.</div>`;
+      toast.innerHTML = `<div class="plsr-kicker">${svgIcon('ok')}<span>Heads Up</span></div><div class="plsr-toast-message">Checked this site, looks fine.</div>`;
       document.body.appendChild(toast);
       setTimeout(() => toast.remove(), 3500);
       return;
@@ -485,6 +752,73 @@
     evaluate();
   }
 
+  // --- Tier 3: evidence from the in-page probe -----------------------------
+  //
+  // page-probe.js reports facts; the thresholds are applied here. That split
+  // is deliberate — the probe runs in the page's own world, where hostile
+  // script can read and forge what it sends. Keeping judgment on this side
+  // means a page cannot reach the criteria, and because render() never
+  // downgrades, a forged message can only raise a warning, never clear one.
+
+  function handleProbeEvent(data) {
+    const probe = state.signals.probe;
+    const criteria = INSPECTION.CRITERIA.network;
+
+    if (data.kind === 'traffic') {
+      const t = data.detail;
+      if (!t || !t.crossOrigin) return; // a page talking to itself is a page working
+
+      const rule = criteria.exfilWhileTyping;
+      const duringTyping = t.msSinceKeystroke !== null &&
+        t.msSinceKeystroke <= rule.maxMsSinceKeystroke &&
+        !t.afterSubmit;
+
+      if (!probe.exfilWhileTyping && duringTyping && rule.kinds.includes(t.kind)) {
+        updateSignals({
+          probe: {
+            ...probe,
+            exfilWhileTyping: { host: t.host, kind: t.kind, msSinceKeystroke: t.msSinceKeystroke },
+          },
+        });
+        return;
+      }
+      if (t.kind === 'websocket' && !probe.websocketHosts.includes(t.host)) {
+        updateSignals({ probe: { ...probe, websocketHosts: [...probe.websocketHosts, t.host] } });
+      }
+      return;
+    }
+
+    if (data.kind === 'keystroke_listener') {
+      const event = data.detail && data.detail.event;
+      if (event && !probe.keystrokeListeners.includes(event)) {
+        updateSignals({ probe: { ...probe, keystrokeListeners: [...probe.keystrokeListeners, event] } });
+      }
+      return;
+    }
+
+    if (data.kind === 'action_mutated' && !probe.actionMutation && data.detail) {
+      updateSignals({ probe: { ...probe, actionMutation: data.detail } });
+    }
+  }
+
+  function listenToProbe() {
+    window.addEventListener('message', (event) => {
+      if (event.source !== window) return;
+      const data = event.data;
+      if (!data || data.__plsr !== 'plsr-probe' || !data.kind) return;
+      try { handleProbeEvent(data); } catch (_) { /* a malformed report is not a verdict */ }
+    });
+  }
+
+  function askNetworkEvidence() {
+    ask('CHECK_NETWORK_EVIDENCE', state.signals.hostname).then((response) => {
+      // No worker, no permission, or no buffer for this tab all land here.
+      // "No evidence" is not "no problem", so the signal simply stays null.
+      if (!response || !response.networkEvidence) return;
+      updateSignals({ network: response.networkEvidence });
+    });
+  }
+
   // --- Init ----------------------------------------------------------------
 
   function initialize() {
@@ -500,10 +834,21 @@
       tldRisky: RISKY_TLDS.has(getTld(ctx.hostname)),
       claimedBrand: extractBrandClaim(),
       formMismatch: null,
+      // Tier 2 findings, filled in at focus: the checks need to know which
+      // field the user is actually about to type into.
+      page: null,
+      // Tier 3, in-page half. Always an object so no template has to guard it.
+      probe: { exfilWhileTyping: null, websocketHosts: [], keystrokeListeners: [], actionMutation: null },
+      // Tier 3, webRequest half. Null until the worker answers, and null
+      // forever if the permission was declined — which is a missing signal,
+      // not a clean verdict.
+      network: null,
       firstVisit: demoFirstVisit !== null ? demoFirstVisit === 'true' : null,
       domainAgeDays: demoAge !== null ? Number(demoAge) : null,
       blocklistHit: demoBlocklist !== null ? demoBlocklist === 'true' : null,
     };
+
+    listenToProbe();
 
     // Gate the lookups on having a hostname worth looking up rather than on
     // the page protocol: a file:// demo page that declares a real hostname
@@ -530,14 +875,19 @@
     document.addEventListener('focusin', (e) => {
       if (!isSensitiveField(e.target)) return;
       state.focused = true;
-      // The form-destination check needs the focused field to find its form,
-      // so it runs here rather than up front.
-      const mismatch = findFormActionMismatch(e.target);
-      if (mismatch) {
-        updateSignals({ formMismatch: mismatch });
-      } else {
-        evaluate();
-      }
+      // The Tier 2 checks and the form-destination check all need the focused
+      // field — which form it belongs to, where it sits on screen, what is
+      // stacked above it — so they run here rather than up front.
+      updateSignals({
+        formMismatch: findFormActionMismatch(e.target),
+        page: INSPECTION.inspectPage(e.target),
+      });
+
+      // Tier 3's webRequest buffer is asked for now and once more shortly
+      // after: scripts and channels a page opens in response to the user
+      // reaching the login form have not necessarily loaded yet at focus time.
+      askNetworkEvidence();
+      setTimeout(askNetworkEvidence, 1200);
     });
   }
 
