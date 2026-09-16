@@ -3,9 +3,11 @@
 <body>
 <pre id="out">running</pre>
 <script>
-// Drives each real demo-pages/*.html file through content.js and asserts the
-// banner matches what DEMO.md documents. PAGES and CONTENT_JS are injected as
-// base64 by the runner.
+// Drives each real demo-pages/*.html file through the extension and asserts
+// the banner matches what DEMO.md documents. Sources are injected as base64 by
+// the runner, in the same order the manifest loads them.
+const PROBE_JS = decodeURIComponent(escape(atob(window.__PROBE_B64)));
+const INSPECTION_JS = decodeURIComponent(escape(atob(window.__INSPECTION_B64)));
 const CONTENT_JS = decodeURIComponent(escape(atob(window.__CONTENT_B64)));
 const PAGES = JSON.parse(atob(window.__PAGES_B64)).map(p => ({ name: p.name, html: decodeURIComponent(escape(atob(p.b64))) }));
 
@@ -27,18 +29,29 @@ function load(html) {
   // or blocklist tag, so those calls return null and must still produce the
   // documented result.
   w.chrome = { runtime: { lastError: null, sendMessage: (m, cb) => setTimeout(() => cb(null), 0) } };
-  const s = d.createElement('script');
-  s.textContent = CONTENT_JS;
-  d.body.appendChild(s);
+  for (const src of [PROBE_JS, INSPECTION_JS, CONTENT_JS]) {
+    const s = d.createElement('script');
+    s.textContent = src;
+    d.body.appendChild(s);
+  }
   return f;
 }
 const msg = (f) => { const e = f.contentDocument.querySelector('.plsr-banner .plsr-message'); return e ? e.textContent : null; };
 const lvl = (f) => { const e = f.contentDocument.querySelector('.plsr-banner'); return e ? (e.className.includes('plsr-danger') ? 'danger' : 'warning') : null; };
-const toast = (f) => { const e = f.contentDocument.querySelector('.plsr-toast'); return e ? e.textContent : null; };
+const toast = (f) => { const e = f.contentDocument.querySelector('.plsr-toast-message'); return e ? e.textContent : null; };
+const why = (f) => [...f.contentDocument.querySelectorAll('.plsr-why-list li')].map((li) => li.textContent).join('|');
 function focusPw(f) {
   const i = f.contentDocument.querySelector('input[type=password]');
   if (!i) return false;
   i.dispatchEvent(new f.contentWindow.FocusEvent('focusin', { bubbles: true }));
+  return true;
+}
+// Drives the one scenario that only exists while the user is mid-keystroke.
+function typeInPw(f) {
+  const i = f.contentDocument.querySelector('input[type=password]');
+  if (!i) return false;
+  i.dispatchEvent(new f.contentWindow.KeyboardEvent('keydown', { bubbles: true, key: 'a' }));
+  i.dispatchEvent(new f.contentWindow.Event('input', { bubbles: true }));
   return true;
 }
 
@@ -64,6 +77,20 @@ const EXPECT = {
     onLoad: null, level: 'danger',
     afterFocus: 'Anything you type here goes to someone other than Chase.',
   },
+  // Tier 2: every domain signal is clean and the form posts to itself. The
+  // only evidence is geometric.
+  '7-overlay-capture.html': {
+    onLoad: null, level: 'danger',
+    afterFocus: "The box you're typing into isn't part of this page — something is layered over it.",
+    why: (v) => v.includes('invisible') && v.includes('urgency or account-suspension language'),
+  },
+  // Tier 3: nothing is observable until the page acts, so this one is
+  // deliberately clean at focus and only escalates once a key is pressed.
+  '8-keystroke-exfil.html': {
+    onLoad: null, afterFocus: null, level: null, toast: true,
+    afterTyping: 'This page is sending what you type as you type it, before you ever hit submit.',
+    levelAfterTyping: 'danger',
+  },
 };
 
 async function main() {
@@ -80,7 +107,14 @@ async function main() {
       check(page.name + ' :: after focus', msg(f), exp.afterFocus);
     }
     if (exp.level !== undefined) check(page.name + ' :: level', lvl(f), exp.level);
-    if (exp.toast) check(page.name + ' :: looks-fine toast', toast(f), 'Checked this site — looks fine.');
+    if (exp.toast) check(page.name + ' :: looks-fine toast', toast(f), 'Checked this site, looks fine.');
+    if (exp.why) check(page.name + ' :: why-list', why(f), exp.why);
+    if (exp.afterTyping !== undefined) {
+      check(page.name + ' :: typing reached the field', typeInPw(f), true);
+      await wait(60);
+      check(page.name + ' :: after typing', msg(f), exp.afterTyping);
+      check(page.name + ' :: level after typing', lvl(f), exp.levelAfterTyping);
+    }
   }
   const failed = results.filter((r) => r.startsWith('FAIL')).length;
   document.getElementById('out').textContent =
