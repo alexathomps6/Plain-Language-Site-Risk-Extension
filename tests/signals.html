@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html>
+<body>
+<pre id="out">running</pre>
+<script>
+// Test harness: drives content.js inside isolated iframes with a stubbed
+// chrome API, then asserts on the banner the extension actually renders.
+// Sources are injected as base64 by the runner script.
+const CONTENT_JS = decodeURIComponent(escape(atob(window.__CONTENT_B64)));
+const BACKGROUND_JS = decodeURIComponent(escape(atob(window.__BACKGROUND_B64)));
+
+const results = [];
+function check(name, actual, expected) {
+  const pass = typeof expected === 'function' ? expected(actual) : actual === expected;
+  results.push((pass ? 'PASS  ' : 'FAIL  ') + name + (pass ? '' : `\n        expected: ${expected}\n        actual:   ${actual}`));
+}
+
+function makeFrame(bodyHtml, headHtml) {
+  const f = document.createElement('iframe');
+  f.style.cssText = 'width:600px;height:400px';
+  document.body.appendChild(f);
+  const d = f.contentDocument;
+  d.open();
+  d.write(`<!DOCTYPE html><html><head>${headHtml || ''}</head><body>${bodyHtml}</body></html>`);
+  d.close();
+  return f;
+}
+
+// Runs content.js inside a frame with chrome.runtime.sendMessage answering
+// from `replies`. Set replies[type] = null to simulate a failed lookup.
+function runExtension(frame, replies, delayMs) {
+  const w = frame.contentWindow;
+  w.chrome = {
+    runtime: {
+      lastError: null,
+      sendMessage(msg, cb) {
+        const reply = Object.prototype.hasOwnProperty.call(replies, msg.type) ? replies[msg.type] : null;
+        setTimeout(() => cb(reply), delayMs || 0);
+      },
+    },
+  };
+  const s = w.document.createElement('script');
+  s.textContent = CONTENT_JS;
+  w.document.body.appendChild(s);
+}
+
+function bannerText(frame) {
+  const el = frame.contentDocument.querySelector('.plsr-banner .plsr-message');
+  return el ? el.textContent : null;
+}
+function bannerLevel(frame) {
+  const el = frame.contentDocument.querySelector('.plsr-banner');
+  if (!el) return null;
+  return el.className.includes('plsr-danger') ? 'danger' : 'warning';
+}
+function toastText(frame) {
+  const el = frame.contentDocument.querySelector('.plsr-toast');
+  return el ? el.textContent : null;
+}
+function whyList(frame) {
+  return [...frame.contentDocument.querySelectorAll('.plsr-why-list li')].map((li) => li.textContent);
+}
+function focusPassword(frame) {
+  const input = frame.contentDocument.querySelector('input[type=password]');
+  input.dispatchEvent(new frame.contentWindow.FocusEvent('focusin', { bubbles: true }));
+  return input;
+}
+
+const LOGIN_FORM = '<form action="/login"><input type="password" id="p"></form>';
+const meta = (n, v) => `<meta name="${n}" content="${v}">`;
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function main() {
+  // --- 1. Typosquat + young domain -> danger, names brand and age ---------
+  {
+    const f = makeFrame('<h1>PayPal</h1>' + LOGIN_FORM,
+      meta('demo-hostname', 'paypa1-secure-login.tk') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '2') + meta('demo-blocklist-hit', 'false') + meta('demo-first-visit', 'true'));
+    runExtension(f, {});
+    await wait(20);
+    check('1a typosquat+young: no banner before focus', bannerText(f), null);
+    focusPassword(f);
+    await wait(20);
+    check('1b typosquat+young: message', bannerText(f),
+      'This site was registered 2 days ago and is not the real PayPal.');
+    check('1c typosquat+young: level', bannerLevel(f), 'danger');
+    check('1d typosquat+young: cites first visit', whyList(f).join('|'),
+      (v) => v.includes('First time this browser'));
+  }
+
+  // --- 2. Blocklist hit -> danger immediately, no focus needed ------------
+  {
+    const f = makeFrame('<h1>Free Crypto</h1>' + LOGIN_FORM,
+      meta('demo-hostname', 'totally-legit-crypto-giveaway.xyz') + meta('demo-https', 'true') +
+      meta('demo-blocklist-hit', 'true'));
+    runExtension(f, {});
+    await wait(20);
+    check('2a blocklist: fires without focus', bannerText(f),
+      'This page has already been reported for stealing passwords. Do not enter anything here.');
+    check('2b blocklist: level', bannerLevel(f), 'danger');
+  }
+
+  // --- 3. Form action mismatch -> danger, names destination and brand -----
+  {
+    const f = makeFrame(
+      '<h1>Chase</h1><form action="https://collector.evil-exfil.com/grab"><input type="password" id="p"></form>',
+      meta('demo-hostname', 'account-services-portal.com') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '4000') + meta('demo-blocklist-hit', 'false') + meta('demo-first-visit', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    check('3a form mismatch: silent before focus', bannerText(f), null);
+    focusPassword(f);
+    await wait(20);
+    check('3b form mismatch: message names claimed brand', bannerText(f),
+      'Anything you type here goes to someone other than Chase.');
+    check('3c form mismatch: level', bannerLevel(f), 'danger');
+    check('3d form mismatch: why names destination', whyList(f).join('|'),
+      (v) => v.includes('collector.evil-exfil.com'));
+  }
+
+  // --- 4. Clean site -> looks-fine toast, no banner -----------------------
+  {
+    const f = makeFrame('<h1>First National Bank</h1>' + LOGIN_FORM,
+      meta('demo-hostname', 'secure-firstnational-bank.com') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '9125') + meta('demo-blocklist-hit', 'false') +
+      meta('demo-first-visit', 'false') + meta('demo-arrived-via-link', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    check('4a clean: no banner', bannerText(f), null);
+    check('4b clean: shows toast', toastText(f), 'Checked this site — looks fine.');
+  }
+
+  // --- 5. Plain HTTP -> warning ------------------------------------------
+  {
+    const f = makeFrame('<h1>Community Forum</h1>' + LOGIN_FORM,
+      meta('demo-hostname', 'old-community-forum.net') + meta('demo-https', 'false') +
+      meta('demo-domain-age-days', '6200') + meta('demo-blocklist-hit', 'false') + meta('demo-first-visit', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    check('5a http: level', bannerLevel(f), 'warning');
+    check('5b http: message', bannerText(f), (v) => v && v.startsWith('This page is not encrypted.'));
+  }
+
+  // --- 6. First visit via link, no age data -> warning --------------------
+  {
+    const f = makeFrame('<h1>New Service</h1>' + LOGIN_FORM,
+      meta('demo-hostname', 'some-new-service.com') + meta('demo-https', 'true') +
+      meta('demo-arrived-via-link', 'true') + meta('demo-first-visit', 'true') +
+      meta('demo-blocklist-hit', 'false'));
+    runExtension(f, { CHECK_DOMAIN_AGE: { domainAgeDays: null } });
+    await wait(20);
+    focusPassword(f);
+    await wait(30);
+    check('6a first-visit: level', bannerLevel(f), 'warning');
+    check('6b first-visit: message', bannerText(f), (v) => v && v.includes('never been to this site before'));
+  }
+
+  // --- 7. Escalation: warning first, upgraded by late RDAP ----------------
+  {
+    const f = makeFrame('<h1>PayPal</h1>' + LOGIN_FORM,
+      meta('demo-hostname', 'paypa1-login.xyz') + meta('demo-https', 'true') +
+      meta('demo-blocklist-hit', 'false') + meta('demo-first-visit', 'false'));
+    // RDAP is slow: 120ms. Typosquat is synchronous, so the first verdict is
+    // typosquat_only (danger); after RDAP lands it should become the
+    // age-qualified danger message.
+    runExtension(f, { CHECK_DOMAIN_AGE: { domainAgeDays: 3 } }, 120);
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    const early = bannerText(f);
+    check('7a escalation: immediate verdict without waiting for RDAP', early,
+      'This domain closely resembles PayPal but is not their official site.');
+    await wait(200);
+    check('7b escalation: upgraded once RDAP landed', bannerText(f),
+      'This site was registered 3 days ago and is not the real PayPal.');
+    check('7c escalation: still danger', bannerLevel(f), 'danger');
+  }
+
+  // --- 8. Never downgrade: late null must not clear a danger banner -------
+  {
+    const f = makeFrame('<h1>PayPal</h1>' + LOGIN_FORM,
+      meta('demo-hostname', 'paypa1-secure.tk') + meta('demo-https', 'true') +
+      meta('demo-blocklist-hit', 'false') + meta('demo-first-visit', 'false'));
+    runExtension(f, { CHECK_DOMAIN_AGE: { domainAgeDays: null } }, 100);
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    const before = bannerLevel(f);
+    await wait(200);
+    check('8a no-downgrade: danger before late null', before, 'danger');
+    check('8b no-downgrade: still danger after', bannerLevel(f), 'danger');
+  }
+
+  // --- 9. Offline: every lookup fails, warning must still render ----------
+  {
+    const f = makeFrame('<h1>Login</h1>' + LOGIN_FORM,
+      meta('demo-hostname', 'brand-new-thing.top') + meta('demo-https', 'true'));
+    runExtension(f, { CHECK_DOMAIN_AGE: null, CHECK_BLOCKLIST: null, CHECK_FIRST_VISIT: null });
+    await wait(20);
+    focusPassword(f);
+    await wait(30);
+    check('9a offline: still renders a verdict', bannerText(f), (v) => v && v.length > 0);
+    check('9b offline: risky TLD caught locally', bannerText(f),
+      (v) => v && v.includes('domain ending is commonly used'));
+  }
+
+  // --- 10. Determinism: same evidence -> identical message ----------------
+  {
+    const head = meta('demo-hostname', 'paypa1-secure-login.tk') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '2') + meta('demo-blocklist-hit', 'false');
+    const a = makeFrame('<h1>PayPal</h1>' + LOGIN_FORM, head);
+    const b = makeFrame('<h1>PayPal</h1>' + LOGIN_FORM, head);
+    runExtension(a, {}); runExtension(b, {});
+    await wait(20);
+    focusPassword(a); focusPassword(b);
+    await wait(20);
+    check('10a determinism: identical text', bannerText(a), bannerText(b));
+    check('10b determinism: identical why-list', whyList(a).join('|'), whyList(b).join('|'));
+  }
+
+  // --- 11. Same-origin form must NOT trip the mismatch check --------------
+  {
+    const f = makeFrame('<h1>My Bank</h1><form action="' + location.origin + '/login"><input type="password" id="p"></form>',
+      meta('demo-https', 'true') + meta('demo-domain-age-days', '5000') +
+      meta('demo-blocklist-hit', 'false') + meta('demo-first-visit', 'false') +
+      meta('demo-arrived-via-link', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    check('11 same-origin form: no false positive', bannerText(f), null);
+  }
+
+  // --- 12. background.js pure helpers ------------------------------------
+  {
+    const stubChrome = {
+      runtime: { onMessage: { addListener() {} }, onInstalled: { addListener() {} }, getURL: (p) => p },
+      alarms: { create() {}, onAlarm: { addListener() {} } },
+      storage: { local: { get: async () => ({}), set: async () => {} } },
+    };
+    const factory = new Function('chrome', BACKGROUND_JS + '\n;return { registrableDomain, parseFeed };');
+    const bg = factory(stubChrome);
+
+    check('12a registrable: simple', bg.registrableDomain('www.github.com'), 'github.com');
+    check('12b registrable: deep subdomain', bg.registrableDomain('a.b.c.example.com'), 'example.com');
+    check('12c registrable: multi-part suffix', bg.registrableDomain('www.bbc.co.uk'), 'bbc.co.uk');
+    check('12d registrable: already bare', bg.registrableDomain('example.com'), 'example.com');
+    check('12e registrable: trailing dot', bg.registrableDomain('github.com.'), 'github.com');
+    check('12f parseFeed: strips scheme and path',
+      bg.parseFeed('https://evil.com/a/b\nhttp://bad.net\n\nnot a domain\n').join(','), 'evil.com,bad.net');
+    check('12g parseFeed: dedupes',
+      bg.parseFeed('https://x.com\nhttps://x.com/other').join(','), 'x.com');
+  }
+
+  const failed = results.filter((r) => r.startsWith('FAIL')).length;
+  document.getElementById('out').textContent =
+    results.join('\n') + `\n\nSUMMARY ${results.length - failed}/${results.length} passed` +
+    (failed ? ' :: SOME_FAILED' : ' :: ALL_PASSED');
+}
+
+main().catch((e) => {
+  document.getElementById('out').textContent = 'HARNESS_ERROR: ' + (e && e.stack || e);
+});
+</script>
+</body>
+</html>

@@ -1,9 +1,19 @@
 {
   "manifest_version": 3,
-  "name": "Plain-Language Site Risk Checker (Demo)",
-  "version": "0.2.0",
-  "description": "Flags risky sites in plain language when you focus a password or payment field. Hackathon demo build — reputation/domain-age checks are mocked locally so it runs with no API keys and no backend. Uses the history permission to check whether this is your first visit to a domain.",
-  "permissions": ["history"],
+  "name": "Plain-Language Site Risk Checker",
+  "version": "0.3.0",
+  "description": "Flags risky sites in plain language when you focus a password or payment field. All detection runs locally; domain age uses the free, keyless RDAP protocol and fails open if unavailable. No API keys, no backend.",
+  "permissions": ["history", "storage", "alarms"],
+  "host_permissions": [
+    "https://rdap.org/*",
+    "https://rdap.verisign.com/*",
+    "https://rdap.publicinterestregistry.org/*",
+    "https://rdap.centralnic.com/*",
+    "https://rdap.identitydigital.services/*",
+    "https://rdap.zdnsgtld.com/*",
+    "https://rdap.registry.click/*",
+    "https://rdap.nominet.uk/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },

@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html>
+<body>
+<pre id="out">running</pre>
+<script>
+// Drives each real demo-pages/*.html file through content.js and asserts the
+// banner matches what DEMO.md documents. PAGES and CONTENT_JS are injected as
+// base64 by the runner.
+const CONTENT_JS = decodeURIComponent(escape(atob(window.__CONTENT_B64)));
+const PAGES = JSON.parse(atob(window.__PAGES_B64)).map(p => ({ name: p.name, html: decodeURIComponent(escape(atob(p.b64))) }));
+
+const results = [];
+function check(name, actual, expected) {
+  const pass = typeof expected === 'function' ? expected(actual) : actual === expected;
+  results.push((pass ? 'PASS  ' : 'FAIL  ') + name + (pass ? '' : `\n        expected: ${expected}\n        actual:   ${actual}`));
+}
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function load(html) {
+  const f = document.createElement('iframe');
+  f.style.cssText = 'width:800px;height:600px';
+  document.body.appendChild(f);
+  const d = f.contentDocument;
+  d.open(); d.write(html); d.close();
+  const w = f.contentWindow;
+  // No demo page should need a live lookup -- page 5 deliberately has no age
+  // or blocklist tag, so those calls return null and must still produce the
+  // documented result.
+  w.chrome = { runtime: { lastError: null, sendMessage: (m, cb) => setTimeout(() => cb(null), 0) } };
+  const s = d.createElement('script');
+  s.textContent = CONTENT_JS;
+  d.body.appendChild(s);
+  return f;
+}
+const msg = (f) => { const e = f.contentDocument.querySelector('.plsr-banner .plsr-message'); return e ? e.textContent : null; };
+const lvl = (f) => { const e = f.contentDocument.querySelector('.plsr-banner'); return e ? (e.className.includes('plsr-danger') ? 'danger' : 'warning') : null; };
+const toast = (f) => { const e = f.contentDocument.querySelector('.plsr-toast'); return e ? e.textContent : null; };
+function focusPw(f) {
+  const i = f.contentDocument.querySelector('input[type=password]');
+  if (!i) return false;
+  i.dispatchEvent(new f.contentWindow.FocusEvent('focusin', { bubbles: true }));
+  return true;
+}
+
+const EXPECT = {
+  '1-safe-bank.html': { onLoad: null, afterFocus: null, level: null, toast: true },
+  '2-phishing-typosquat.html': {
+    onLoad: null, level: 'danger',
+    afterFocus: 'This site was registered 2 days ago and is not the real PayPal.',
+  },
+  '3-known-bad-blocklist.html': {
+    onLoad: 'This page has already been reported for stealing passwords. Do not enter anything here.',
+    level: 'danger',
+  },
+  '4-unencrypted-http.html': {
+    onLoad: null, level: 'warning',
+    afterFocus: (v) => v && v.startsWith('This page is not encrypted.'),
+  },
+  '5-first-visit-via-link.html': {
+    onLoad: null, level: 'warning',
+    afterFocus: (v) => v && v.includes('never been to this site before'),
+  },
+  '6-form-action-mismatch.html': {
+    onLoad: null, level: 'danger',
+    afterFocus: 'Anything you type here goes to someone other than Chase.',
+  },
+};
+
+async function main() {
+  for (const page of PAGES) {
+    const exp = EXPECT[page.name];
+    if (!exp) { results.push('FAIL  no expectation defined for ' + page.name); continue; }
+    const f = load(page.html);
+    await wait(40);
+    check(page.name + ' :: before focus', msg(f), exp.onLoad);
+    if (exp.afterFocus !== undefined) {
+      const ok = focusPw(f);
+      check(page.name + ' :: has a password field', ok, true);
+      await wait(40);
+      check(page.name + ' :: after focus', msg(f), exp.afterFocus);
+    }
+    if (exp.level !== undefined) check(page.name + ' :: level', lvl(f), exp.level);
+    if (exp.toast) check(page.name + ' :: looks-fine toast', toast(f), 'Checked this site — looks fine.');
+  }
+  const failed = results.filter((r) => r.startsWith('FAIL')).length;
+  document.getElementById('out').textContent =
+    results.join('\n') + `\n\nSUMMARY ${results.length - failed}/${results.length} passed` +
+    (failed ? ' :: SOME_FAILED' : ' :: ALL_PASSED');
+}
+main().catch((e) => { document.getElementById('out').textContent = 'HARNESS_ERROR: ' + (e && e.stack || e); });
+</script>
+</body>
+</html>

