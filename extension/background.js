@@ -1,10 +1,11 @@
 // Background service worker.
 //
-// Owns the three lookups a content script cannot do itself:
+// Owns the lookups a content script cannot do itself:
 //
-//   CHECK_FIRST_VISIT — chrome.history is unavailable to content scripts
-//   CHECK_DOMAIN_AGE  — cross-origin RDAP fetch (see note on CORS below)
-//   CHECK_BLOCKLIST   — reads the bundled feed snapshot
+//   CHECK_FIRST_VISIT       — chrome.history is unavailable to content scripts
+//   CHECK_DOMAIN_AGE        — cross-origin RDAP fetch (see note on CORS below)
+//   CHECK_BLOCKLIST         — reads the bundled feed snapshot
+//   CHECK_NETWORK_EVIDENCE  — Tier 3: the per-tab webRequest evidence buffer
 //
 // Every handler fails open. A lookup that times out, errors, or has no data
 // resolves to null, never to a false "safe" or a false "dangerous". The
@@ -176,6 +177,205 @@ async function refreshBlocklist() {
   }
 }
 
+// --- Tier 3: network traffic inspection ------------------------------------
+//
+// Observational only. MV3 removed blocking webRequest, so nothing here can
+// stop a request; it watches metadata and hands the content script evidence.
+// Request and response bodies are never read.
+//
+// One deliberate asymmetry worth stating: the listener sees full URLs, because
+// the browser hands them over, but only ever *stores* a hostname. The path and
+// query of every request the user's browser makes are visible for the duration
+// of one synchronous callback and then dropped. The only place a path is even
+// examined is the exfil-service match below, where "discord.com" and
+// "discord.com/api/webhooks/..." are genuinely different facts — and even
+// there, only the host is retained.
+
+const NETWORK_CRITERIA = {
+  // A hop count on its own means little: CDNs, locale routers and SSO flows
+  // all redirect. Crossing two or more *different sites* on the way is the
+  // part that characterises a shortener-into-open-redirect chain.
+  redirectChain: { minHops: 2, minDistinctSites: 2 },
+  // Caps, so a long-lived tab on a heavy site cannot grow the buffer without
+  // bound. Evidence is qualitative — the first 50 distinct hosts of a kind are
+  // as diagnostic as the first 5000.
+  limits: { maxHostsPerKind: 50, maxRedirectHops: 20, maxTabs: 100 },
+};
+
+const RAW_IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+
+const URL_SHORTENERS = new Set([
+  'bit.ly', 't.co', 'tinyurl.com', 'goo.gl', 'ow.ly', 'buff.ly', 'is.gd', 'cutt.ly',
+  'rebrand.ly', 'shorturl.at', 'rb.gy', 't.ly', 'lnkd.in', 'bit.do', 's.id', 'qrco.de',
+]);
+
+// Services a phishing kit reaches for when it needs somewhere to put stolen
+// data without standing up a server. Matched against the full URL because the
+// distinction between a site and its webhook endpoint is the whole point.
+const EXFIL_SERVICES = [
+  { pattern: /^https?:\/\/api\.telegram\.org\/bot/i, label: 'Telegram' },
+  { pattern: /^https?:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\//i, label: 'a Discord webhook' },
+  { pattern: /^https?:\/\/(?:www\.)?pastebin\.com\/api\//i, label: 'Pastebin' },
+  { pattern: /^https?:\/\/(?:[a-z0-9-]+\.)?webhook\.site\//i, label: 'webhook.site' },
+  { pattern: /^https?:\/\/(?:[a-z0-9-]+\.)?requestbin\.(?:com|net)\//i, label: 'RequestBin' },
+  { pattern: /^https?:\/\/(?:[a-z0-9-]+\.)?(?:m\.)?pipedream\.net\//i, label: 'Pipedream' },
+  { pattern: /^https?:\/\/(?:[a-z0-9-]+\.)?beeceptor\.com\//i, label: 'Beeceptor' },
+  { pattern: /^https?:\/\/(?:[a-z0-9-]+\.)?(?:ngrok\.io|ngrok-free\.app|trycloudflare\.com|loca\.lt|serveo\.net)\//i, label: 'a temporary tunnel host' },
+  { pattern: /^https?:\/\/(?:www\.)?(?:formspree\.io|formsubmit\.co|getform\.io|staticforms\.xyz)\//i, label: 'a form-relay service' },
+];
+
+// Script origins that are ordinary infrastructure rather than a one-off host
+// registered alongside the phishing domain.
+const KNOWN_CDNS = new Set([
+  'googleapis.com', 'gstatic.com', 'google.com', 'googletagmanager.com', 'google-analytics.com',
+  'cloudflare.com', 'cloudflareinsights.com', 'jsdelivr.net', 'unpkg.com', 'jquery.com',
+  'bootstrapcdn.com', 'fontawesome.com', 'akamaihd.net', 'akamaized.net', 'cloudfront.net',
+  'azureedge.net', 'azurefd.net', 'facebook.net', 'hotjar.com', 'segment.com', 'segment.io',
+  'newrelic.com', 'nr-data.net', 'sentry.io', 'typekit.net', 'stripe.com', 'stripe.network',
+  'paypal.com', 'paypalobjects.com', 'recaptcha.net', 'hcaptcha.com', 'onetrust.com',
+  'cookielaw.org', 'adyen.com', 'braintreegateway.com', 'okta.com', 'oktacdn.com', 'auth0.com',
+  'microsoftonline.com', 'msauth.net', 'msftauth.net', 'apple.com', 'squarecdn.com',
+]);
+
+// tabId -> evidence buffer. Reset on every top-level navigation, so evidence
+// always describes the page currently on screen.
+const tabEvidence = new Map();
+
+function blankEvidence(pageHost) {
+  return {
+    pageHost: pageHost || null,
+    startedAt: Date.now(),
+    redirects: [],
+    rawIpHosts: new Set(),
+    exfilServices: new Map(), // host -> label
+    scriptHosts: new Set(),
+    websocketHosts: new Set(),
+  };
+}
+
+function addCapped(set, value) {
+  if (set.size < NETWORK_CRITERIA.limits.maxHostsPerKind) set.add(value);
+}
+
+function evidenceFor(tabId) {
+  return tabId >= 0 ? tabEvidence.get(tabId) : null;
+}
+
+function resetTab(tabId, pageHost) {
+  if (tabEvidence.size >= NETWORK_CRITERIA.limits.maxTabs && !tabEvidence.has(tabId)) {
+    // Evict the oldest buffer rather than growing forever. A tab whose buffer
+    // is gone simply reports no network evidence, which fails open.
+    const oldest = [...tabEvidence.entries()].sort((a, b) => a[1].startedAt - b[1].startedAt)[0];
+    if (oldest) tabEvidence.delete(oldest[0]);
+  }
+  tabEvidence.set(tabId, blankEvidence(pageHost));
+}
+
+function hostOfUrl(url) {
+  try { return new URL(url).hostname; }
+  catch (_) { return null; }
+}
+
+function isRawIpHost(host) {
+  return RAW_IPV4.test(host) || host.startsWith('[');
+}
+
+// A raw IP only means something for resources that carry code or data. A
+// logo served from an IP address is a badly configured site; a script or an
+// XHR endpoint on one is a different claim entirely, and conflating them
+// would put a danger-level banner on ordinary intranet pages.
+const CODE_AND_DATA_TYPES = new Set(['script', 'xmlhttprequest', 'websocket', 'sub_frame', 'object']);
+
+function recordRequest(details) {
+  const { tabId, url, type } = details;
+
+  if (type === 'main_frame') {
+    resetTab(tabId, hostOfUrl(url));
+    return;
+  }
+  const evidence = evidenceFor(tabId);
+  if (!evidence) return;
+
+  const host = hostOfUrl(url);
+  if (!host) return;
+
+  if (CODE_AND_DATA_TYPES.has(type) && isRawIpHost(host)) addCapped(evidence.rawIpHosts, host);
+
+  const service = EXFIL_SERVICES.find((s) => s.pattern.test(url));
+  if (service && evidence.exfilServices.size < NETWORK_CRITERIA.limits.maxHostsPerKind) {
+    evidence.exfilServices.set(host, service.label);
+  }
+
+  if (type === 'script' && evidence.pageHost &&
+      registrableDomain(host) !== registrableDomain(evidence.pageHost) &&
+      !KNOWN_CDNS.has(registrableDomain(host))) {
+    addCapped(evidence.scriptHosts, host);
+  }
+
+  if (type === 'websocket' && evidence.pageHost &&
+      registrableDomain(host) !== registrableDomain(evidence.pageHost)) {
+    addCapped(evidence.websocketHosts, host);
+  }
+}
+
+function recordRedirect(details) {
+  if (details.type !== 'main_frame') return;
+  const evidence = evidenceFor(details.tabId);
+  if (!evidence) return;
+  if (evidence.redirects.length >= NETWORK_CRITERIA.limits.maxRedirectHops) return;
+  const from = hostOfUrl(details.url);
+  const to = hostOfUrl(details.redirectUrl);
+  if (from && to) evidence.redirects.push({ from, to });
+  // A redirect rewrites where the page came from, so the page host has to
+  // follow it or every later same-site comparison is made against the wrong
+  // origin.
+  if (to) evidence.pageHost = to;
+}
+
+// Evaluate the buffer against the criteria above. Returns plain, structured
+// facts; the content script turns them into a sentence.
+function summarizeNetworkEvidence(tabId) {
+  const evidence = evidenceFor(tabId);
+  if (!evidence) return { networkEvidence: null }; // no buffer, no claim
+
+  const sites = new Set();
+  evidence.redirects.forEach(({ from, to }) => {
+    sites.add(registrableDomain(from));
+    sites.add(registrableDomain(to));
+  });
+  const viaShortener = evidence.redirects.find(({ from }) => URL_SHORTENERS.has(registrableDomain(from)));
+  const suspiciousChain =
+    (evidence.redirects.length >= NETWORK_CRITERIA.redirectChain.minHops &&
+     sites.size >= NETWORK_CRITERIA.redirectChain.minDistinctSites) ||
+    Boolean(viaShortener);
+
+  return {
+    networkEvidence: {
+      redirectChain: suspiciousChain
+        ? {
+            hops: evidence.redirects.length,
+            sites: [...sites],
+            shortener: viaShortener ? registrableDomain(viaShortener.from) : null,
+          }
+        : null,
+      rawIpHosts: [...evidence.rawIpHosts],
+      exfilServices: [...evidence.exfilServices].map(([host, label]) => ({ host, label })),
+      unrelatedScriptHosts: [...evidence.scriptHosts],
+      websocketHosts: [...evidence.websocketHosts],
+    },
+  };
+}
+
+// webRequest is unavailable if the permission was declined; the extension
+// still works, it just has no Tier 3 network evidence.
+if (chrome.webRequest) {
+  chrome.webRequest.onBeforeRequest.addListener(recordRequest, { urls: ['<all_urls>'] });
+  chrome.webRequest.onBeforeRedirect.addListener(recordRedirect, { urls: ['<all_urls>'] });
+}
+if (chrome.tabs && chrome.tabs.onRemoved) {
+  chrome.tabs.onRemoved.addListener((tabId) => tabEvidence.delete(tabId));
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create('refresh-blocklist', { periodInMinutes: BLOCKLIST_REFRESH_HOURS * 60 });
   loadBlocklist().catch(() => {});
@@ -196,6 +396,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'CHECK_FIRST_VISIT') {
     handleFirstVisit(message.hostname, sendResponse);
     return true; // keep the channel open for the async history callback
+  }
+
+  // Synchronous: the buffer is already in memory, and the tab is taken from
+  // the sender rather than the message, so a page cannot ask about a tab that
+  // is not its own.
+  if (message.type === 'CHECK_NETWORK_EVIDENCE') {
+    const tabId = sender && sender.tab ? sender.tab.id : -1;
+    sendResponse(summarizeNetworkEvidence(tabId));
+    return false;
   }
 
   const handler = ASYNC_HANDLERS[message.type];

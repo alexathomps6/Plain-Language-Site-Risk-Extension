@@ -1,18 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Plain-Language Site Risk Checker",
-  "version": "0.3.0",
-  "description": "Flags risky sites in plain language when you focus a password or payment field. All detection runs locally; domain age uses the free, keyless RDAP protocol and fails open if unavailable. No API keys, no backend.",
-  "permissions": ["history", "storage", "alarms"],
+  "version": "0.4.0",
+  "description": "Flags risky sites in plain language when you focus a password or payment field. Inspects the rendered page and the traffic it generates, all locally; domain age uses the free, keyless RDAP protocol and fails open if unavailable. No API keys, no backend.",
+  "permissions": ["history", "storage", "alarms", "webRequest"],
   "host_permissions": [
-    "https://rdap.org/*",
-    "https://rdap.verisign.com/*",
-    "https://rdap.publicinterestregistry.org/*",
-    "https://rdap.centralnic.com/*",
-    "https://rdap.identitydigital.services/*",
-    "https://rdap.zdnsgtld.com/*",
-    "https://rdap.registry.click/*",
-    "https://rdap.nominet.uk/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js"
@@ -20,7 +13,14 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>", "file:///*"],
-      "js": ["content.js"],
+      "js": ["page-probe.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["<all_urls>", "file:///*"],
+      "js": ["page-inspection.js", "content.js"],
       "css": ["banner.css"],
       "run_at": "document_idle",
       "all_frames": false

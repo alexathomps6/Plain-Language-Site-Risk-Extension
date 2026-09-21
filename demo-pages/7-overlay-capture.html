@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Wells Fargo - Sign On</title>
+<!--
+  Demo simulation only. Tier 2, rendered page inspection.
+
+  Like page 6, every Tier 1 domain signal is clean: HTTPS, a plain .com,
+  registered nine years ago, no blocklist hit, not a first visit. Unlike page
+  6, the form action is clean too — it posts to this very page. A reputation
+  tool and a form-destination check both have nothing to say.
+
+  What gives it away is geometry. A transparent password field is layered
+  exactly over the visible one, so the click lands on the attacker's input
+  while the user watches the real field they think they are filling in. The
+  extension hit-tests every credential field on the page and finds the visible
+  one covered.
+
+  The urgency copy in the card is real lexicon material too, but it only ever
+  reaches the "why" list -- pressure language is corroboration, never a
+  verdict, because plenty of genuine account-recovery pages sound like this.
+-->
+<meta name="demo-hostname" content="wf-online-access.com">
+<meta name="demo-https" content="true">
+<meta name="demo-domain-age-days" content="3290">
+<meta name="demo-blocklist-hit" content="false">
+<meta name="demo-arrived-via-link" content="false">
+<meta name="demo-first-visit" content="false">
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; background: #f6f4ef; margin: 0; }
+  .header { background: #B31B1B; color: #fff; padding: 16px 28px; font-size: 19px; font-weight: 700; letter-spacing: .3px; }
+  .card { max-width: 380px; margin: 32px auto; background: #fff; padding: 26px 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,.08); }
+  h2 { margin: 0 0 6px; font-size: 19px; }
+  .alert { background: #fff6e5; border-left: 3px solid #d98f00; padding: 10px 12px; font-size: 12.5px; color: #5d4200; line-height: 1.5; margin-bottom: 16px; }
+  label { display: block; font-size: 13px; margin: 12px 0 5px; color: #333; }
+  input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
+  button { margin-top: 18px; width: 100%; padding: 11px; background: #B31B1B; color: #fff; border: none; border-radius: 6px; font-size: 15px; cursor: pointer; }
+  .note { max-width: 460px; margin: 0 auto 40px; text-align: center; color: #888; font-size: 12px; line-height: 1.55; }
+
+  /* The attack. A second password input, visually absent, pinned exactly over
+     the real one and painted above it. Anything typed goes into this one. */
+  .pw-stack { position: relative; }
+  .pw-stack .capture {
+    position: absolute;
+    inset: 0;
+    opacity: 0.01;
+    background: transparent;
+    border: none;
+    z-index: 5;
+  }
+</style>
+</head>
+<body>
+  <div class="header">Wells Fargo</div>
+  <div class="card">
+    <h2>Sign on to view your accounts</h2>
+    <div class="alert">
+      Unusual sign-in activity was detected on your account. Your access will be revoked
+      within 24 hours unless you verify your identity now.
+    </div>
+    <form action="/sign-on" method="POST">
+      <label for="user">Username</label>
+      <input id="user" type="text" autocomplete="username">
+
+      <label for="pass">Password</label>
+      <div class="pw-stack">
+        <input id="pass" type="password" autocomplete="current-password">
+        <input id="capture" class="capture" type="password" autocomplete="off" aria-hidden="true">
+      </div>
+
+      <button type="submit">Sign on</button>
+    </form>
+  </div>
+  <p class="note">
+    Demo page &mdash; the domain checks all pass and the form posts to itself,
+    so nothing at the domain or markup level is wrong. Click into the password
+    field: the extension hit-tests the field's own box and finds a transparent
+    input sitting on top of it.
+  </p>
+</body>
+</html>

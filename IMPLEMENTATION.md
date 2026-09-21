@@ -12,7 +12,15 @@ steps 3 and 4.
 ## Architecture
 
 ```
-Content script (per page)
+Page probe (MAIN world, document_start)
+      |
+      +--> wraps fetch / XHR / sendBeacon / WebSocket / addEventListener
+      |         |
+      |         v
+      |    facts only, over postMessage  (no thresholds, no values, host only)
+      |
+      v
+Content script (isolated world, per page)
       |
       +--> on page load ---------------> Tier 1: known-bad check
       |                                        |
@@ -21,7 +29,9 @@ Content script (per page)
       |                                        |
       |                                       yes --> banner shown immediately
       |
-      +--> on password/payment focus --> Tier 2: heuristic checks
+      +--> on password/payment focus --> Tier 1 heuristics + Tier 2 page inspection
+      |                                        |
+      +--> on probe report -------------> Tier 3 criteria applied here
                                                 |
                                                 v
                                     Signals combiner (rule-based, no ML)
@@ -34,6 +44,10 @@ Background service worker  <-- chrome.runtime.sendMessage --  Content script
       +--> chrome.history.search() ----> first visit?   (on-device, no network)
       +--> rdap.org -> registry --------> domain age    (open protocol, no key)
       +--> bundled CC0 feed snapshot ---> blocklist     (refreshed on a 12h alarm)
+      +--> chrome.webRequest listeners -> per-tab evidence buffer
+                                          (redirect chain, raw IPs, exfil
+                                           services, script origins, sockets;
+                                           hostnames only, memory only)
 
 Every one of these fails open: timeout, offline or no-data resolves to null,
 never to a verdict.
@@ -46,23 +60,31 @@ Two trigger tiers, not one:
   some attacks (drive-by downloads, malicious redirects, background
   scripts) don't require the user to click or type anything — waiting for
   an action would mean this warning arrives too late or never.
-- **Tier 2 — on password/payment field focus.** Everything else (domain
-  age, typosquat, TLD, referrer context, first-visit history) is
-  probabilistic, not certain. Firing these on every page load is exactly
-  how people learn to ignore security warnings, so they wait for the
-  moment the risk actually materializes: handing the site sensitive data.
+- **On password/payment field focus.** Everything else (domain age,
+  typosquat, TLD, referrer context, first-visit history, and all of the
+  Tier 2 page inspection) is probabilistic, not certain. Firing these on
+  every page load is exactly how people learn to ignore security warnings,
+  so they wait for the moment the risk actually materializes: handing the
+  site sensitive data.
+- **On keystroke.** Tier 3's in-page half reports nothing until a secret is
+  actually being typed. A page that never receives a keystroke in a
+  credential field produces no traffic evidence at all.
 
-Two components, not three:
+Three components, not four:
 
-- **Content script** — runs both tiers, reads page context (URL, referrer,
-  HTTPS state), inspects the rendered page, and never reads or transmits
-  what the user types.
+- **Page probe** — a `world: "MAIN"` content script at `document_start`. The
+  only vantage point from which traffic can be correlated with typing. It is a
+  sensor: it reports facts and applies no thresholds, because it runs in the
+  page's own world where hostile script can read and forge what it sends.
+- **Content script** — runs the domain heuristics and the rendered-page
+  inspection, applies the Tier 3 in-page criteria to what the probe reports,
+  and never reads or transmits what the user types.
 - **Background service worker** — owns every lookup the content script
-  cannot do itself. `chrome.history` is unavailable to content scripts, and
-  a cross-origin RDAP fetch from page context is subject to CORS at each
-  redirect hop. The content script asks via `chrome.runtime.sendMessage`
-  and the worker answers.
-- **No backend.** This used to be a third component. It isn't needed: see
+  cannot do itself. `chrome.history` is unavailable to content scripts, a
+  cross-origin RDAP fetch from page context is subject to CORS at each
+  redirect hop, and `chrome.webRequest` is worker-only. The content script
+  asks via `chrome.runtime.sendMessage` and the worker answers.
+- **No backend.** This used to be a further component. It isn't needed: see
   steps 3 and 4 for how the two "server-only" lookups were replaced with a
   keyless protocol and a bundled feed.
 
@@ -343,10 +365,84 @@ silently disabled escalation everywhere it was most worth testing.
   rather than nothing at all — this keeps the check visibly active without
   becoming a persistent, ignorable badge.
 
-## What runs for real
+### 11. Tier 2: real rendered-page inspection against stated criteria
 
+`extension/page-inspection.js`. Nine checks, each a measurement against a named
+constant in a single `CRITERIA` object at the top of the file, so a reviewer
+can read the criterion and find the number without reading the algorithm.
+[`CRITERIA.md`](CRITERIA.md) documents every threshold and the false positive
+it exists to avoid.
+
+The checks: insecure form action, field inventory plausibility, overlay over a
+credential field, shadow capture inputs, fake browser chrome, third-party
+credential frames, script obfuscation, anti-inspection, and pressure language.
+
+Three decisions worth recording:
+
+- **The overlay check scans every visible credential field, not just the
+  focused one.** First cut checked only the focused element and would never
+  have fired. In the realistic attack the focused field *is* the attacker's
+  transparent input; the evidence is that the visible field underneath it is
+  covered. Checking only the focused element looks at the wrong end of the
+  attack.
+- **Value mirroring was designed and then dropped.** Comparing a hidden
+  input's value against the visible field's would detect mirror-capture
+  directly, and would mean the extension reads what the user types — the one
+  thing it promises not to do. The structural shadow-input check covers the
+  same attack without ever touching a value.
+- **Entropy alone is a bad obfuscation signal.** The first threshold was 4.6
+  bits/char. Measured against this repository's own source, ordinary commented
+  JavaScript runs 4.86–5.16, so it fired on everything and contributed nothing.
+  It is now 5.2 *and* gated on average line length ≥ 500, because packed
+  payloads are one enormous line and human source is not. There is a test
+  asserting this project's own code does not trip the check.
+
+Every check is wrapped in try/catch by `inspectPage()`: a broken check returns
+null rather than a verdict.
+
+### 12. Tier 3: real traffic inspection, in two halves
+
+Neither half can see what the other can, so both exist.
+
+**`extension/page-probe.js`** runs in the page's own JavaScript world
+(`world: "MAIN"`, `document_start`) and wraps `fetch`, `XMLHttpRequest`,
+`sendBeacon`, `WebSocket`, `addEventListener` and `setAttribute`. This is the
+only place traffic can be correlated with typing: `chrome.webRequest` sees that
+a request went to a host, not that it left 40ms after a keystroke in a password
+field and before any submit.
+
+`world: "MAIN"` rather than injecting a `<script>` tag through
+`web_accessible_resources`: no CSP problems, and it genuinely runs at
+`document_start`.
+
+**`extension/background.js`** holds observational `chrome.webRequest` listeners
+and a per-tab evidence buffer for redirect chains, raw-IP endpoints, known
+exfil services, script origins and WebSockets.
+
+The two design points that matter:
+
+- **The probe is a sensor, not a judge.** It reports facts; `content.js`
+  applies `CRITERIA.network`. The probe runs where hostile script can read and
+  forge its `postMessage` traffic, so keeping the thresholds on the other side
+  of that boundary means a page cannot reach them. And because the banner never
+  downgrades, a forged message can only raise a warning, never clear one.
+- **The probe is gated on typing.** It emits no traffic metadata at all until a
+  keystroke lands in a sensitive field (or a WebSocket opens on a page that has
+  one). That is what lets it sit on `<all_urls>` without being a general
+  traffic recorder. On an ordinary page nobody types a password into, it is
+  silent.
+
+The worker's asymmetry is stated in the source and in the README: the listener
+*sees* full URLs because the browser hands them over, and *stores* only
+hostnames. The one place a path is examined at all is the known-exfil-service
+match, where `discord.com` and `discord.com/api/webhooks/…` are genuinely
+different facts — and even there only the host is retained.
+
+## What runs for real
 Nothing is mocked. Every signal below runs from the loaded extension with no
-API key and no server, and is covered by `./tests/run.sh`.
+API key and no server, and is covered by `./tests/run.sh`. The thresholds
+behind the Tier 2 and Tier 3 rows are documented, with their false-positive
+reasoning, in [`CRITERIA.md`](CRITERIA.md).
 
 | Signal | Trigger | How it works |
 |---|---|---|
@@ -356,6 +452,17 @@ API key and no server, and is covered by `./tests/run.sh`.
 | Typosquat / homograph distance | On password/payment focus | Levenshtein against a brand list, whole label and per segment |
 | Brand claim | On password/payment focus | Title, headings, `og:site_name`, logo `alt` |
 | Form destination mismatch | On password/payment focus | `action` / `formaction` attribute resolved against `location.origin` |
+| Form action rewritten at runtime | Whenever it happens | `setAttribute` wrapper in the page probe |
+| Insecure (HTTP) form action | On password/payment focus | Resolved `action` protocol, on an HTTPS page only |
+| Field inventory plausibility | On password/payment focus | `type` / `autocomplete` / label text, seven categories |
+| Overlay over a credential field | On password/payment focus | `elementsFromPoint` hit test, 3 of 5 sample points |
+| Fake browser chrome | On password/payment focus | Top-of-viewport position + rendered URL + padlock |
+| Shadow capture input | On password/payment focus | Computed style and geometry, never values |
+| Third-party credential frame | On password/payment focus | Iframe/form overlap fraction, provider allowlist |
+| Script obfuscation / anti-inspection | On password/payment focus | Packer signature, or two independent indicators |
+| Pressure language | On password/payment focus | Lexicon match in the form's block; supporting only |
+| Exfil-shaped traffic while typing | On keystroke | `fetch`/XHR/beacon/WebSocket wrappers, 2s correlation window |
+| Known exfil services, raw IPs, redirect chains, script origins | Continuous | `chrome.webRequest` evidence buffer, per tab, host-only |
 | Referrer / "arrived via link" | On password/payment focus | `document.referrer`; same-browser navigation only |
 | First visit to this domain | On password/payment focus | `chrome.history.search()` in the worker, on-device |
 | Domain age | On password/payment focus, async | Live RDAP via `rdap.org`, cached 24h, 2.5s timeout, fails open |
@@ -399,14 +506,32 @@ is either really measured or openly declared by the page under inspection.
 - **The blocklist is a community snapshot, not Safe Browsing.** It catches
   domains that have already been reported and will miss a kit in its first
   hours. That gap is the entire argument for the page-level checks.
+- **Tier 3 needs `webRequest` and `<all_urls>`, which is a real escalation of
+  what the extension can see.** It is the price of a redirect chain or a
+  credential POST to a raw IP. The mitigation is in the code, not the prose:
+  only hostnames are stored, the buffer is in memory, it resets on every
+  top-level navigation, and it is deleted when the tab closes.
+- **`world: "MAIN"` content scripts need Chrome/Edge 111+.** On anything older
+  the Tier 3 in-page half is silent and only the `webRequest` half runs. The
+  extension degrades rather than breaks.
+- **A WebSocket opened at `document_start` is missed by the probe,** because
+  `content.js` has not registered its message listener yet. The `webRequest`
+  listener is the backstop for exactly that case, which is why both halves
+  check for it.
+- **The overlay hit test only measures a field inside the viewport.** A
+  credential field scrolled off-screen returns no measurement rather than a
+  clean result — deliberate "no evidence", not "no problem".
+- **The obfuscation check reads inline `<script>` content only.** A kit that
+  loads its payload from an external `src` is judged on origin (Tier 3) rather
+  than content.
+- **Adversarial evasion against DOM inspection is a known gap.** A login form
+  rendered entirely in canvas, or buried in closed shadow DOM, defeats the
+  Tier 2 geometry checks. Tier 3 still sees where the data goes.
 
 ## Stretch goals if time allows
 
-- Tier 3 traffic inspection: observational `webRequest` listeners for redirect
-  chains, third-party script origins, and exfil-shaped beacons. This is what
-  demo step 6 needs.
-- The remaining Tier 2 checks: field-inventory plausibility, overlay and iframe
-  trickery, keystroke-capture detection, structural clone similarity.
+- Structural clone similarity: DOM skeleton and stylesheet fingerprints
+  compared against known brand login pages.
 - The full Public Suffix List in place of the small multi-part suffix set, so
   registrable-domain extraction is correct for every ccTLD.
 - A user allowlist ("always trust my bank's real domain") to cut repeat
